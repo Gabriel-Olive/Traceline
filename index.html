@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mini CAD 2D - Correções de Fluxo e Trava de Seleção</title>
+    <style>
+        body {
+            margin: 0; padding: 0;
+            font-family: 'Segoe UI', sans-serif;
+            background-color: #1e1e1e; color: #fff;
+            display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+        }
+        #toolbar {
+            background-color: #2d2d2d; padding: 10px;
+            display: flex; gap: 8px; align-items: center;
+            border-bottom: 2px solid #3d3d3d;
+            user-select: none; flex-wrap: wrap;
+        }
+        .group {
+            display: flex; gap: 4px; border-right: 1px solid #555; padding-right: 8px; margin-right: 4px;
+        }
+        .group:last-child { border-right: none; }
+        .label { font-size: 11px; color: #888; text-transform: uppercase; margin-bottom: 2px; display: block; font-weight: bold;}
+        button {
+            background-color: #444; color: white; border: 1px solid #555;
+            padding: 6px 12px; cursor: pointer; border-radius: 4px; font-weight: bold; font-size: 13px;
+        }
+        button.active { background-color: #007acc; border-color: #0098ff; }
+        button:hover { background-color: #555; }
+        #input-panel { margin-left: auto; display: flex; gap: 5px; align-items: center; }
+        input[type="text"] {
+            background-color: #333; border: 1px solid #555;
+            color: white; padding: 6px; border-radius: 4px; width: 150px;
+        }
+        #canvas-container { flex: 1; position: relative; cursor: crosshair; }
+        canvas { display: block; width: 100%; height: 100%; }
+        #statusbar {
+            background-color: #2d2d2d; padding: 5px 15px;
+            font-size: 12px; color: #aaa; border-top: 1px solid #3d3d3d;
+            display: flex; gap: 20px; user-select: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="toolbar">
+        <div class="group">
+            <div>
+                <span class="label">Desenhar</span>
+                <button id="btn-line" class="active" onclick="setMode('line')">Linha</button>
+                <button id="btn-polyline" onclick="setMode('polyline')">Polyline</button>
+                <button id="btn-circle" onclick="setMode('circle')">Círculo</button>
+            </div>
+        </div>
+        
+        <div class="group">
+            <div>
+                <span class="label">Modificar</span>
+                <button id="btn-move" onclick="setMode('move')">Move</button>
+                <button id="btn-offset" onclick="setMode('offset')">Offset</button>
+                <button id="btn-trim" onclick="setMode('trim')">Trim</button>
+                <button id="btn-delete" onclick="setMode('delete')" style="background-color: #a23333;">Delete</button>
+            </div>
+        </div>
+
+        <button onclick="clearSelection()" style="background-color: #555;">Limpar Seleção</button>
+        <button onclick="clearCanvas()" style="background-color: #222;">Limpar Tudo</button>
+        
+        <div id="input-panel">
+            <span style="font-size: 12px; color: #aaa;" id="prompt-label">Distância:</span>
+            <input type="text" id="coord-input" placeholder="Digite e aperte Enter..." autocomplete="off">
+        </div>
+    </div>
+
+    <div id="canvas-container">
+        <canvas id="cadCanvas"></canvas>
+    </div>
+
+    <div id="statusbar">
+        <div>Cursor: <span id="coord-display">X: 0, Y: 0</span></div>
+        <div>Modo Atual: <span id="mode-display" style="color:#0098ff; font-weight:bold;">LINHA</span></div>
+        <div>Selecionados: <span id="select-count" style="color:#ffaa00; font-weight:bold;">0</span></div>
+        <div id="instruction-display" style="color: #ffaa00;">Clique para iniciar o desenho.</div>
+    </div>
+
+    <script>
+        // --- 1. CLASSES GEOMÉTRICAS ---
+        class Point {
+            constructor(x, y) { this.x = x; this.y = y; }
+            distanceTo(other) { return Math.hypot(this.x - other.x, this.y - other.y); }
+        }
+
+        class Line {
+            constructor(p1, p2) { this.p1 = p1; this.p2 = p2; this.id = Math.random(); }
+            getSnapPoints() {
+                return [
+                    { point: this.p1, type: 'endpoint' },
+                    { point: this.p2, type: 'endpoint' },
+                    { point: new Point((this.p1.x + this.p2.x)/2, (this.p1.y + this.p2.y)/2), type: 'midpoint' }
+                ];
+            }
+            draw(ctx, selected = false) {
+                ctx.beginPath(); ctx.moveTo(this.p1.x, this.p1.y); ctx.lineTo(this.p2.x, this.p2.y); 
+                if(selected) { ctx.strokeStyle = '#00bfff'; ctx.lineWidth = 3 / zoom; }
+                ctx.stroke();
+            }
+            distanceToPoint(pt) {
+                const A = pt.x - this.p1.x; const B = pt.y - this.p1.y;
+                const C = this.p2.x - this.p1.x; const D = this.p2.y - this.p1.y;
+                const dot = A * C + B * D; const len_sq = C * C + D * D;
+                let param = -1; if (len_sq !== 0) param = dot / len_sq;
+                let xx, yy;
+                if (param < 0) { xx = this.p1.x; yy = this.p1.y; }
+                else if (param > 1) { xx = this.p2.x; yy = this.p2.y; }
+                else { xx = this.p1.x + param * C; yy = this.p1.y + param * D; }
+                return Math.hypot(pt.x - xx, pt.y - yy);
+            }
+            isFullyInside(xMin, xMax, yMin, yMax) {
+                return (this.p1.x >= xMin && this.p1.x <= xMax && this.p1.y >= yMin && this.p1.y <= yMax) &&
+                       (this.p2.x >= xMin && this.p2.x <= xMax && this.p2.y >= yMin && this.p2.y <= yMax);
+            }
+            intersectsBox(xMin, xMax, yMin, yMax) {
+                if (this.isFullyInside(xMin, xMax, yMin, yMax)) return true;
+                if (findLineIntersection(this.p1, this.p2, new Point(xMin, yMin), new Point(xMax, yMin), true)) return true;
+                if (findLineIntersection(this.p1, this.p2, new Point(xMax, yMin), new Point(xMax, yMax), true)) return true;
+                if (findLineIntersection(this.p1, this.p2, new Point(xMax, yMax), new Point(xMin, yMax), true)) return true;
+                if (findLineIntersection(this.p1, this.p2, new Point(xMin, yMax), new Point(xMin, yMin), true)) return true;
+                return false;
+            }
+        }
+
+        class Polyline {
+            constructor(points) { this.points = [...points]; this.id = Math.random(); }
+            getSnapPoints() {
+                const snaps = [];
+                this.points.forEach((p, idx) => {
+                    snaps.push({ point: p, type: 'endpoint' });
+                    if (idx < this.points.length - 1) {
+                        const next = this.points[idx + 1];
+                        snaps.push({ point: new Point((p.x + next.x)/2, (p.y + next.y)/2), type: 'midpoint' });
+                    }
+                });
+                return snaps;
+            }
+            draw(ctx, selected = false) {
+                if (this.points.length < 2) return;
+                ctx.beginPath(); ctx.moveTo(this.points[0].x, this.points[0].y);
+                for(let i = 1; i < this.points.length; i++) ctx.lineTo(this.points[i].x, this.points[i].y);
+                if(selected) { ctx.strokeStyle = '#00bfff'; ctx.lineWidth = 3 / zoom; }
+                ctx.stroke();
+            }
+            distanceToPoint(pt) {
+                let minDist = Infinity;
+                for (let i = 0; i < this.points.length - 1; i++) {
+                    let segment = new Line(this.points[i], this.points[i+1]);
+                    minDist = Math.min(minDist, segment.distanceToPoint(pt));
+                }
+                return minDist;
+            }
+            isFullyInside(xMin, xMax, yMin, yMax) {
+                return this.points.every(p => p.x >= xMin && p.x <= xMax && p.y >= yMin && p.y <= yMax);
+            }
+            intersectsBox(xMin, xMax, yMin, yMax) {
+                if (this.isFullyInside(xMin, xMax, yMin, yMax)) return true;
+                for (let i = 0; i < this.points.length - 1; i++) {
+                    let seg = new Line(this.points[i], this.points[i+1]);
+                    if (seg.intersectsBox(xMin, xMax, yMin, yMax)) return true;
+                }
+                return false;
+            }
+        }
+
+        class Circle {
+            constructor(center, radius) { this.center = center; this.radius = radius; this.id = Math.random(); }
+            getSnapPoints() {
+                const c = this.center; const r = this.radius;
+                return [
+                    { point: c, type: 'center' },
+                    { point: new Point(c.x, c.y - r), type: 'quadrant' },
+                    { point: new Point(c.x + r, c.y), type: 'quadrant' },
+                    { point: new Point(c.x, c.y + r), type: 'quadrant' },
+                    { point: new Point(c.x - r, c.y), type: 'quadrant' }
+                ];
+            }
+            draw(ctx, selected = false) {
+                ctx.beginPath(); ctx.arc(this.center.x, this.center.y, this.radius, 0, 2 * Math.PI); 
+                if(selected) { ctx.strokeStyle = '#00bfff'; ctx.lineWidth = 3 / zoom; }
+                ctx.stroke();
+            }
+            distanceToPoint(pt) { return Math.abs(this.center.distanceTo(pt) - this.radius); }
+            isFullyInside(xMin, xMax, yMin, yMax) {
+                return (this.center.x - this.radius >= xMin && this.center.x + this.radius <= xMax &&
+                        this.center.y - this.radius >= yMin && this.center.y + this.radius <= yMax);
+            }
+            intersectsBox(xMin, xMax, yMin, yMax) {
+                if (this.isFullyInside(xMin, xMax, yMin, yMax)) return true;
+                let closestX = Math.max(xMin, Math.min(this.center.x, xMax));
+                let closestY = Math.max(yMin, Math.min(this.center.y, yMax));
+                return this.center.distanceTo(new Point(closestX, closestY)) <= this.radius;
+            }
+        }
+
+        // --- 2. ESTADO GLOBAL ---
+        const canvas = document.getElementById('cadCanvas');
+        const ctx = canvas.getContext('2d');
+        const coordInput = document.getElementById('coord-input');
+        
+        let shapes = [];
+        let currentMode = 'line';
+        let currentPoints = [];   
+        
+        let screenMousePos = new Point(0, 0); 
+        let computedPt = new Point(0, 0);  
+        let currentPolarAngle = null;
+
+        let zoom = 1.0;
+        let panX = 0; let panY = 0;
+        let isPanning = false; let startPan = { x: 0, y: 0 };
+
+        let activeSnap = null;
+        let trackedPoints = []; 
+
+        // Modificações e Seleção
+        let selectedShapes = []; 
+        let moveBasePoint = null;
+        let offsetDistance = 50;
+        let selectionPhase = "select"; // "select" ou "basepoint" ou "target"
+
+        let selectionStartPt = null; 
+        let isSelectingBox = false;
+
+        const SNAP_TOLERANCE_SCREEN = 15; 
+        const POLAR_ANGLES = [0, 45, 90, 135, 180, 225, 270, 315];
+        const POLAR_TOLERANCE = 4 * (Math.PI / 180);
+
+        function resizeCanvas() {
+            canvas.width = canvas.parentElement.clientWidth; canvas.height = canvas.parentElement.clientHeight;
+            drawEverything();
+        }
+        window.addEventListener('resize', resizeCanvas);
+        setTimeout(resizeCanvas, 100);
+
+        function screenToModel(sPt) { return new Point((sPt.x - panX) / zoom, (sPt.y - panY) / zoom); }
+
+        // --- 3. PROCESSO DE ENGENHARIA SNAP ---
+        function findLineIntersection(p1, p2, p3, p4, limitToSegments = false) {
+            const denom = (p4.y - p3.y) * (p2.x - p1.x) - (p4.x - p3.x) * (p2.y - p1.y);
+            if (Math.abs(denom) < 0.0001) return null; 
+            const ua = ((p4.x - p3.x) * (p1.y - p3.y) - (p4.y - p3.y) * (p1.x - p3.x)) / denom;
+            const ub = ((p2.x - p1.x) * (p1.y - p3.y) - (p2.y - p1.y) * (p1.x - p3.x)) / denom;
+            if (limitToSegments && (ua < 0 || ua > 1 || ub < 0 || ub > 1)) return null;
+            return new Point(p1.x + ua * (p2.x - p1.x), p1.y + ua * (p2.y - p1.y));
+        }
+
+        function getAllPhysicalSegments() {
+            let segments = [];
+            shapes.forEach(shape => {
+                if (shape instanceof Line) segments.push(shape);
+                else if (shape instanceof Polyline) {
+                    for (let i = 0; i < shape.points.length - 1; i++) {
+                        segments.push(new Line(shape.points[i], shape.points[i+1]));
+                    }
+                }
+            });
+            return segments;
+        }
+
+        function processCalculatedPoint() {
+            const modelMouse = screenToModel(screenMousePos);
+            const toleranceModel = SNAP_TOLERANCE_SCREEN / zoom;
+            activeSnap = null; currentPolarAngle = null;
+
+            // Desativa snap APENAS na fase de seleção pura da caixa
+            if (isSelectingBox || (currentMode === 'move' && selectionPhase === 'select') || ['trim', 'offset', 'delete'].includes(currentMode)) {
+                computedPt = modelMouse; return;
+            }
+
+            // SNAP DIRETO (Ativo no desenho e nas fases de Basepoint/Target do Move!)
+            for (const shape of shapes) {
+                for (const snap of shape.getSnapPoints()) {
+                    if (modelMouse.distanceTo(snap.point) < toleranceModel) {
+                        if (!trackedPoints.some(p => p.x === snap.point.x && p.y === snap.point.y) && trackedPoints.length < 2) {
+                            trackedPoints.push(snap.point);
+                        }
+                        activeSnap = { point: snap.point, type: snap.type }; computedPt = snap.point; return;
+                    }
+                }
+            }
+
+            // GUIAS VIRTUAIS
+            let virtualLines = [];
+            trackedPoints.forEach(tPt => {
+                virtualLines.push({ p1: new Point(tPt.x - 10000, tPt.y), p2: new Point(tPt.x + 10000, tPt.y), origin: tPt, type: 'otrack' });
+                virtualLines.push({ p1: new Point(tPt.x, tPt.y - 10000), p2: new Point(tPt.x, tPt.y + 10000), origin: tPt, type: 'otrack' });
+            });
+
+            let polarActiveLine = null;
+            if (currentPoints.length > 0 || (currentMode === 'move' && moveBasePoint)) {
+                const basePt = currentPoints.length > 0 ? currentPoints[currentPoints.length - 1] : moveBasePoint;
+                let angle = Math.atan2(modelMouse.y - basePt.y, modelMouse.x - basePt.x);
+                if (angle < 0) angle += 2 * Math.PI;
+
+                for (let targetDeg of POLAR_ANGLES) {
+                    let targetRad = targetDeg * (Math.PI / 180);
+                    let diff = Math.abs(angle - targetRad);
+                    if (diff > Math.PI) diff = 2 * Math.PI - diff;
+                    if (diff < POLAR_TOLERANCE) {
+                        polarActiveLine = { p1: basePt, p2: new Point(basePt.x + Math.cos(targetRad)*10000, basePt.y + Math.sin(targetRad)*10000), type: 'polar', rad: targetRad };
+                        virtualLines.push(polarActiveLine); currentPolarAngle = targetRad; break;
+                    }
+                }
+            }
+
+            // INTERSEÇÕES
+            let bestIntersection = null; let minDist = toleranceModel;
+            let physicalSegments = getAllPhysicalSegments();
+            for (let i = 0; i < physicalSegments.length; i++) {
+                for (let j = i + 1; j < physicalSegments.length; j++) {
+                    let inter = findLineIntersection(physicalSegments[i].p1, physicalSegments[i].p2, physicalSegments[j].p1, physicalSegments[j].p2, true);
+                    if (inter && modelMouse.distanceTo(inter) < minDist) {
+                        minDist = modelMouse.distanceTo(inter); bestIntersection = { point: inter, type: "interseção real" };
+                    }
+                }
+            }
+
+            if (bestIntersection) { activeSnap = bestIntersection; computedPt = bestIntersection.point; return; }
+
+            if (polarActiveLine) {
+                let basePt = polarActiveLine.p1; let dist = basePt.distanceTo(modelMouse);
+                computedPt = new Point(basePt.x + dist * Math.cos(polarActiveLine.rad), basePt.y + dist * Math.sin(polarActiveLine.rad)); return;
+            }
+
+            computedPt = modelMouse;
+        }
+
+        // --- 4. SELEÇÃO ---
+        function getShapeUnderMouse(pt) {
+            let threshold = 12 / zoom; let closestShape = null; let minDist = threshold;
+            shapes.forEach(shape => {
+                let d = shape.distanceToPoint(pt);
+                if (d < minDist) { minDist = d; closestShape = shape; }
+            });
+            return closestShape;
+        }
+
+        function executeBoxSelection(start, end) {
+            let xMin = Math.min(start.x, end.x); let xMax = Math.max(start.x, end.x);
+            let yMin = Math.min(start.y, end.y); let yMax = Math.max(start.y, end.y);
+            let isCrossing = start.x > end.x;
+
+            shapes.forEach(shape => {
+                if (selectedShapes.some(s => s.id === shape.id)) return;
+                if (isCrossing ? shape.intersectsBox(xMin, xMax, yMin, yMax) : shape.isFullyInside(xMin, xMax, yMin, yMax)) {
+                    selectedShapes.push(shape);
+                }
+            });
+            document.getElementById('select-count').innerText = selectedShapes.length;
+        }
+
+        function clearSelection() { selectedShapes = []; selectionPhase = "select"; document.getElementById('select-count').innerText = 0; drawEverything(); }
+
+        // --- 5. COMANDOS ---
+        function runTrim(clickPt) {
+            let segmentToTrim = null; let minD = 12 / zoom;
+            let physicalSegments = getAllPhysicalSegments();
+            physicalSegments.forEach(seg => {
+                let d = seg.distanceToPoint(clickPt); if (d < minD) { minD = d; segmentToTrim = seg; }
+            });
+            if (!segmentToTrim) return;
+
+            let splitPoints = []; let allSegs = getAllPhysicalSegments();
+            allSegs.forEach(s => {
+                let inter = findLineIntersection(segmentToTrim.p1, segmentToTrim.p2, s.p1, s.p2, true);
+                if (inter && inter.distanceTo(segmentToTrim.p1) > 0.01 && inter.distanceTo(segmentToTrim.p2) > 0.01) splitPoints.push(inter);
+            });
+
+            let p1 = segmentToTrim.p1; splitPoints.sort((a, b) => p1.distanceTo(a) - p1.distanceTo(b));
+            let subSegments = []; let currentStart = p1;
+            splitPoints.forEach(pt => { subSegments.push(new Line(currentStart, pt)); currentStart = pt; });
+            subSegments.push(new Line(currentStart, segmentToTrim.p2));
+
+            let indexToRemove = -1;
+            subSegments.forEach((sub, idx) => { if (sub.distanceToPoint(clickPt) < (12 / zoom)) indexToRemove = idx; });
+            if (indexToRemove !== -1) {
+                subSegments.splice(indexToRemove, 1);
+                shapes = shapes.filter(s => s.id !== segmentToTrim.id);
+                subSegments.forEach(sub => shapes.push(sub));
+            }
+        }
+
+        function runOffset(shape, clickPt, distance) {
+            if (!shape || !(shape instanceof Line)) return;
+            let dx = shape.p2.x - shape.p1.x; let dy = shape.p2.y - shape.p1.y; let len = Math.hypot(dx, dy);
+            let nx = -dy / len; let ny = dx / len;
+            let lineA = new Line(new Point(shape.p1.x + nx * distance, shape.p1.y + ny * distance), new Point(shape.p2.x + nx * distance, shape.p2.y + ny * distance));
+            let lineB = new Line(new Point(shape.p1.x - nx * distance, shape.p1.y - ny * distance), new Point(shape.p2.x - nx * distance, shape.p2.y - ny * distance));
+            if (lineA.distanceToPoint(clickPt) < lineB.distanceToPoint(clickPt)) shapes.push(lineA); else shapes.push(lineB);
+        }
+
+        function applyMoveMultiple(items, base, target) {
+            let dx = target.x - base.x; let dy = target.y - base.y;
+            items.forEach(shape => {
+                if (shape instanceof Line) { shape.p1.x += dx; shape.p1.y += dy; shape.p2.x += dx; shape.p2.y += dy; }
+                else if (shape instanceof Circle) { shape.center.x += dx; shape.center.y += dy; }
+                else if (shape instanceof Polyline) { shape.points.forEach(p => { p.x += dx; p.y += dy; }); }
+            });
+        }
+
+        // --- 6. KEYDOWN INTERCEPTOR (ENTERS / ESC) ---
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                if (currentMode === 'polyline' && currentPoints.length > 1) {
+                    shapes.push(new Polyline(currentPoints));
+                }
+                resetState(); return;
+            }
+            if (e.key === 'Enter') {
+                // Se estiver desenhando uma polyline, finaliza injetando os pontos acumulados
+                if (currentMode === 'polyline' && currentPoints.length > 1) {
+                    shapes.push(new Polyline(currentPoints));
+                    resetState(); return;
+                }
+                // Se estiver no MOVE e apertar Enter após selecionar, avança de fase
+                if (currentMode === 'move' && selectionPhase === 'select' && selectedShapes.length > 0) {
+                    selectionPhase = "basepoint";
+                    updateInstructions(); drawEverything(); return;
+                }
+                processCommand(); return;
+            }
+            if (document.activeElement !== coordInput && e.key.match(/[0-9.,-]/)) coordInput.focus();
+        });
+
+        function processCommand() {
+            let val = coordInput.value.trim(); coordInput.value = ''; coordInput.blur();
+            if (!val) return;
+
+            if (currentMode === 'offset' && !isNaN(parseFloat(val))) {
+                offsetDistance = Math.abs(parseFloat(val)); updateInstructions(); return;
+            }
+
+            if (!val.includes(',')) {
+                let dist = parseFloat(val); if (isNaN(dist)) return;
+                let basePt = currentPoints.length > 0 ? currentPoints[currentPoints.length - 1] : (currentMode === 'move' ? moveBasePoint : null);
+                
+                if (basePt) {
+                    let angle = currentPolarAngle !== null ? currentPolarAngle : Math.atan2(screenToModel(screenMousePos).y - basePt.y, screenToModel(screenMousePos).x - basePt.x);
+                    let targetPt = new Point(basePt.x + dist * Math.cos(angle), basePt.y + dist * Math.sin(angle));
+                    
+                    if (currentMode === 'move' && selectionPhase === 'target') {
+                        applyMoveMultiple(selectedShapes, moveBasePoint, targetPt); clearSelection(); resetState();
+                    } else {
+                        addPointToCreation(targetPt);
+                    }
+                }
+            } else {
+                let parts = val.split(','); let x = parseFloat(parts[0]); let y = parseFloat(parts[1]);
+                if (!isNaN(x) && !isNaN(y)) addPointToCreation(new Point(x, -y));
+            }
+        }
+
+        // --- 7. FLUXO DO MOUSE ---
+        canvas.addEventListener('mousedown', (e) => {
+            if (e.button === 1) { 
+                isPanning = true; startPan = { x: e.clientX - panX, y: e.clientY - panY }; e.preventDefault(); return;
+            }
+            if (e.button !== 0) return;
+
+            // Coleta posição com snap ativo nas fases devidas, ou livre
+            const snapClickModel = new Point(computedPt.x, computedPt.y);
+            const pureModelMouse = screenToModel(screenMousePos);
+
+            // FLUXO DO MOVE ATUALIZADO (Separado por fases explícitas)
+            if (currentMode === 'move') {
+                if (selectionPhase === "select") {
+                    let clickedShape = getShapeUnderMouse(pureModelMouse);
+                    if (clickedShape) {
+                        if (!selectedShapes.some(s => s.id === clickedShape.id)) selectedShapes.push(clickedShape);
+                        document.getElementById('select-count').innerText = selectedShapes.length;
+                    } else {
+                        // Caixa de seleção no vazio
+                        isSelectingBox = true; selectionStartPt = pureModelMouse;
+                    }
+                    updateInstructions(); drawEverything(); return;
+                }
+                else if (selectionPhase === "basepoint") {
+                    // Aqui o snap funciona 100% para pegar pontas/meios dos elementos!
+                    moveBasePoint = snapClickModel; 
+                    selectionPhase = "target";
+                    updateInstructions(); drawEverything(); return;
+                }
+                else if (selectionPhase === "target") {
+                    applyMoveMultiple(selectedShapes, moveBasePoint, snapClickModel);
+                    clearSelection(); resetState(); return;
+                }
+            }
+
+            // OUTROS MODOS DE EDICÃO
+            if (currentMode === 'delete') {
+                let clickedShape = getShapeUnderMouse(pureModelMouse);
+                if (clickedShape) {
+                    shapes = shapes.filter(s => s.id !== clickedShape.id);
+                } else {
+                    isSelectingBox = true; selectionStartPt = pureModelMouse;
+                }
+                drawEverything(); return;
+            }
+            if (currentMode === 'trim') { runTrim(pureModelMouse); drawEverything(); return; }
+            if (currentMode === 'offset') {
+                let s = getShapeUnderMouse(pureModelMouse);
+                if (s) runOffset(s, pureModelMouse, offsetDistance);
+                drawEverything(); return;
+            }
+
+            // MODOS DE DESENHO
+            if (['line', 'polyline', 'circle'].includes(currentMode)) {
+                addPointToCreation(snapClickModel);
+            }
+        });
+
+        canvas.addEventListener('mouseup', (e) => { 
+            if (e.button === 1) isPanning = false; 
+            if (e.button === 0 && isSelectingBox) {
+                isSelectingBox = false;
+                executeBoxSelection(selectionStartPt, screenToModel(screenMousePos));
+                selectionStartPt = null; updateInstructions(); drawEverything();
+            }
+        });
+
+        function addPointToCreation(pt) {
+            if (currentMode === 'line') {
+                if (currentPoints.length === 0) currentPoints.push(pt);
+                else { shapes.push(new Line(currentPoints[0], pt)); currentPoints = []; }
+            } else if (currentMode === 'polyline') {
+                currentPoints.push(pt);
+            } else if (currentMode === 'circle') {
+                if (currentPoints.length === 0) currentPoints.push(pt);
+                else { shapes.push(new Circle(currentPoints[0], currentPoints[0].distanceTo(pt))); currentPoints = []; }
+            }
+            drawEverything();
+        }
+
+        // --- 8. UI & RENDER ---
+        function setMode(mode) {
+            currentMode = mode; resetState();
+            document.querySelectorAll('#toolbar button').forEach(b => b.classList.remove('active'));
+            if(document.getElementById(`btn-${mode}`)) document.getElementById(`btn-${mode}`).classList.add('active');
+            document.getElementById('mode-display').innerText = mode.toUpperCase();
+            updateInstructions(); drawEverything();
+        }
+
+        function resetState() {
+            currentPoints = []; moveBasePoint = null; trackedPoints = []; isSelectingBox = false; selectionPhase = "select";
+            updateInstructions(); drawEverything();
+        }
+
+        function clearCanvas() { shapes = []; selectedShapes = []; clearSelection(); resetState(); }
+
+        function updateInstructions() {
+            let inst = ""; let lbl = "Distância / Coord:";
+            if (currentMode === 'line' || currentMode === 'circle') inst = "Clique na tela para iniciar o desenho gráfico.";
+            else if (currentMode === 'polyline') inst = "Clique nos pontos consecutivos. Aperte ENTER para finalizar a Polyline.";
+            else if (currentMode === 'trim') inst = "Clique nas pontas sobressalentes para cortar.";
+            else if (currentMode === 'offset') inst = `Digite a distância e dê Enter [Atual: ${offsetDistance}]. Clique na linha.`;
+            else if (currentMode === 'delete') inst = "Clique no objeto ou abra uma caixa de seleção para apagar.";
+            else if (currentMode === 'move') {
+                if (selectionPhase === "select") inst = `[Fase 1: Seleção] Selecione os objetos desejados. Quando terminar, aperte ENTER.`;
+                else if (selectionPhase === "basepoint") inst = `[Fase 2: Origem] Clique em cima de um SNAP do objeto para usar como PONTO BASE.`;
+                else inst = "Mova o mouse e clique no ponto de DESTINO (ou digite o tamanho + Enter).";
+            }
+            document.getElementById('instruction-display').innerText = inst;
+            document.getElementById('prompt-label').innerText = lbl;
+        }
+
+        canvas.addEventListener('mousemove', (e) => {
+            const rect = canvas.getBoundingClientRect(); screenMousePos = new Point(e.clientX - rect.left, e.clientY - rect.top);
+            if (isPanning) { panX = e.clientX - startPan.x; panY = e.clientY - startPan.y; drawEverything(); return; }
+            processCalculatedPoint();
+            document.getElementById('coord-display').innerText = `X: ${Math.round(computedPt.x)}, Y: ${Math.round(-computedPt.y)}`;
+            drawEverything();
+        });
+
+        canvas.addEventListener('wheel', (e) => {
+            e.preventDefault(); const rect = canvas.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left; const mouseY = e.clientY - rect.top;
+            const modelPtBefore = screenToModel(new Point(mouseX, mouseY));
+            if (e.deltaY < 0) zoom *= 1.1; else zoom /= 1.1;
+            zoom = Math.max(0.05, Math.min(zoom, 50));
+            panX = mouseX - modelPtBefore.x * zoom; panY = mouseY - modelPtBefore.y * zoom;
+            processCalculatedPoint(); drawEverything();
+        }, { passive: false });
+
+        function drawEverything() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.save(); ctx.translate(panX, panY); ctx.scale(zoom, zoom);
+
+            // ORIGEM
+            ctx.strokeStyle = '#ff3333'; ctx.lineWidth = 1 / zoom; ctx.beginPath(); ctx.moveTo(0, -30/zoom); ctx.lineTo(0, 30/zoom); ctx.stroke();
+            ctx.strokeStyle = '#33ff33'; ctx.lineWidth = 1 / zoom; ctx.beginPath(); ctx.moveTo(-30/zoom, 0); ctx.lineTo(30/zoom, 0); ctx.stroke();
+            
+            // GEOMETRIAS
+            shapes.forEach(shape => {
+                ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2 / zoom;
+                let isSel = selectedShapes.some(sel => sel.id === shape.id);
+                shape.draw(ctx, isSel);
+            });
+
+            // ELÁSTICOS DE DESENHO
+            ctx.strokeStyle = '#aaaaaa'; ctx.lineWidth = 1 / zoom; ctx.setLineDash([4 / zoom, 4 / zoom]);
+            if (currentPoints.length > 0) {
+                if (currentMode === 'line') { ctx.beginPath(); ctx.moveTo(currentPoints[0].x, currentPoints[0].y); ctx.lineTo(computedPt.x, computedPt.y); ctx.stroke(); }
+                else if (currentMode === 'polyline') {
+                    ctx.beginPath(); ctx.moveTo(currentPoints[0].x, currentPoints[0].y);
+                    for(let i=1; i<currentPoints.length; i++) ctx.lineTo(currentPoints[i].x, currentPoints[i].y);
+                    ctx.lineTo(computedPt.x, computedPt.y); ctx.stroke();
+                } else if (currentMode === 'circle') { ctx.beginPath(); ctx.arc(currentPoints[0].x, currentPoints[0].y, currentPoints[0].distanceTo(computedPt), 0, 2*Math.PI); ctx.stroke(); }
+            }
+            
+            // PREVIEW DE MOVE EM LOTE
+            if (currentMode === 'move' && selectionPhase === 'target' && moveBasePoint) {
+                ctx.strokeStyle = '#ffaa00'; ctx.lineWidth = 1.5 / zoom;
+                let dx = computedPt.x - moveBasePoint.x; let dy = computedPt.y - moveBasePoint.y;
+                ctx.save(); ctx.translate(dx, dy); selectedShapes.forEach(s => s.draw(ctx, false)); ctx.restore();
+            }
+
+            // POLAR
+            if (currentPolarAngle !== null && !activeSnap && (currentPoints.length > 0 || (currentMode === 'move' && selectionPhase === 'target' && moveBasePoint))) {
+                let bp = currentPoints.length > 0 ? currentPoints[currentPoints.length - 1] : moveBasePoint;
+                ctx.strokeStyle = '#00bcff'; ctx.lineWidth = 1 / zoom; ctx.beginPath(); ctx.moveTo(bp.x, bp.y);
+                ctx.lineTo(bp.x + Math.cos(currentPolarAngle)*20000, bp.y + Math.sin(currentPolarAngle)*20000); ctx.stroke();
+            }
+
+            // CAIXAS DE SELEÇÃO
+            if (isSelectingBox && selectionStartPt) {
+                let endPt = screenToModel(screenMousePos); let isCrossing = selectionStartPt.x > endPt.x;
+                if (isCrossing) { ctx.fillStyle = 'rgba(0, 255, 100, 0.15)'; ctx.strokeStyle = '#00ff64'; ctx.setLineDash([4 / zoom, 4 / zoom]); }
+                else { ctx.fillStyle = 'rgba(0, 110, 255, 0.15)'; ctx.strokeStyle = '#0070ff'; }
+                ctx.lineWidth = 1 / zoom;
+                ctx.fillRect(selectionStartPt.x, selectionStartPt.y, endPt.x - selectionStartPt.x, endPt.y - selectionStartPt.y);
+                ctx.strokeRect(selectionStartPt.x, selectionStartPt.y, endPt.x - selectionStartPt.x, endPt.y - selectionStartPt.y);
+                ctx.setLineDash([]);
+            }
+
+            ctx.restore();
+
+            // RENDER SNAP (Apenas se o snap estiver calculado e ativo)
+            if (activeSnap) {
+                const sX = activeSnap.point.x * zoom + panX; const sY = activeSnap.point.y * zoom + panY;
+                ctx.lineWidth = 2; const size = 12;
+                if (activeSnap.type.includes("interseção") || activeSnap.type.includes("X")) {
+                    ctx.strokeStyle = '#ffff00'; ctx.beginPath(); ctx.moveTo(sX - size/2, sY - size/2); ctx.lineTo(sX + size/2, sY + size/2); ctx.moveTo(sX + size/2, sY - size/2); ctx.lineTo(sX - size/2, sY + size/2); ctx.stroke();
+                } else {
+                    ctx.strokeStyle = '#5cff5c';
+                    if (activeSnap.type === 'endpoint') ctx.strokeRect(sX - size/2, sY - size/2, size, size);
+                    else if (activeSnap.type === 'midpoint') { ctx.beginPath(); ctx.moveTo(sX, sY - size/2); ctx.lineTo(sX + size/2, sY + size/2); ctx.lineTo(sX - size/2, sY + size/2); ctx.closePath(); ctx.stroke(); }
+                    else if (activeSnap.type === 'center') { ctx.beginPath(); ctx.arc(sX, sY, size/2, 0, 2*Math.PI); ctx.stroke(); }
+                    else if (activeSnap.type === 'quadrant') { ctx.beginPath(); ctx.moveTo(sX, sY - size/2); ctx.lineTo(sX + size/2, sY); ctx.lineTo(sX, sY + size/2); ctx.lineTo(sX - size/2, sY); ctx.closePath(); ctx.stroke(); }
+                }
+            }
+        }
+    </script>
+</body>
+</html>
