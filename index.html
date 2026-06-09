@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mini CAD 2D - Correções de Fluxo e Trava de Seleção</title>
+    <title>TraceLine CAD 2D</title>
     <style>
         body {
             margin: 0; padding: 0;
@@ -51,6 +51,7 @@
                 <button id="btn-line" class="active" onclick="setMode('line')">Linha</button>
                 <button id="btn-polyline" onclick="setMode('polyline')">Polyline</button>
                 <button id="btn-circle" onclick="setMode('circle')">Círculo</button>
+                <button id="btn-arc" onclick="setMode('arc')">Arco</button>
             </div>
         </div>
         
@@ -60,6 +61,7 @@
                 <button id="btn-move" onclick="setMode('move')">Move</button>
                 <button id="btn-offset" onclick="setMode('offset')">Offset</button>
                 <button id="btn-trim" onclick="setMode('trim')">Trim</button>
+                <button id="btn-mirror" onclick="setMode('mirror')">Mirror</button>
                 <button id="btn-delete" onclick="setMode('delete')" style="background-color: #a23333;">Delete</button>
             </div>
         </div>
@@ -201,6 +203,105 @@
             }
         }
 
+        // Helper: calcula centro do círculo circunscrito por 3 pontos
+        function circumcircle(p1, p2, p3) {
+            const ax = p1.x, ay = p1.y;
+            const bx = p2.x, by = p2.y;
+            const cx = p3.x, cy = p3.y;
+            const D = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+            if (Math.abs(D) < 1e-10) return null; // pontos colineares
+            const ux = ((ax*ax + ay*ay) * (by - cy) + (bx*bx + by*by) * (cy - ay) + (cx*cx + cy*cy) * (ay - by)) / D;
+            const uy = ((ax*ax + ay*ay) * (cx - bx) + (bx*bx + by*by) * (ax - cx) + (cx*cx + cy*cy) * (bx - ax)) / D;
+            const center = new Point(ux, uy);
+            const radius = center.distanceTo(p1);
+            return { center, radius };
+        }
+
+        // Normaliza ângulo para [0, 2π)
+        function normalizeAngle(a) { return ((a % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI); }
+
+        // Verifica se um ângulo está dentro do arco (sentido anti-horário de start até end)
+        function angleInArc(angle, startA, endA) {
+            angle = normalizeAngle(angle);
+            startA = normalizeAngle(startA);
+            endA = normalizeAngle(endA);
+            if (startA <= endA) return angle >= startA && angle <= endA;
+            return angle >= startA || angle <= endA;
+        }
+
+        class Arc {
+            // p1 = ponto inicial, p3 = ponto intermediário, p2 = ponto final
+            constructor(p1, p3, p2) {
+                this.p1 = p1; this.p3 = p3; this.p2 = p2;
+                this.id = Math.random();
+                this._compute();
+            }
+            _compute() {
+                const cc = circumcircle(this.p1, this.p3, this.p2);
+                if (!cc) { this.valid = false; return; }
+                this.valid = true;
+                this.center = cc.center;
+                this.radius = cc.radius;
+                this.startAngle = normalizeAngle(Math.atan2(this.p1.y - this.center.y, this.p1.x - this.center.x));
+                this.endAngle   = normalizeAngle(Math.atan2(this.p2.y - this.center.y, this.p2.x - this.center.x));
+                // Determina direção: o ponto intermediário p3 deve estar dentro do arco (anti-horário)
+                const midTestAngle = normalizeAngle(Math.atan2(this.p3.y - this.center.y, this.p3.x - this.center.x));
+                // Testa ambas as direções e escolhe aquela que inclui p3
+                const ccwIncludes = angleInArc(midTestAngle, this.startAngle, this.endAngle);
+                this.counterClockwise = ccwIncludes;
+            }
+            getSnapPoints() {
+                if (!this.valid) return [];
+                // Ponto médio do arco
+                let midAngle;
+                const sa = this.startAngle, ea = this.endAngle;
+                if (this.counterClockwise) {
+                    midAngle = sa <= ea ? (sa + ea) / 2 : normalizeAngle(sa + (normalizeAngle(ea - sa + 2*Math.PI)) / 2);
+                } else {
+                    midAngle = ea <= sa ? (sa + ea) / 2 : normalizeAngle(ea + (normalizeAngle(sa - ea + 2*Math.PI)) / 2);
+                }
+                const midPt = new Point(this.center.x + this.radius * Math.cos(midAngle), this.center.y + this.radius * Math.sin(midAngle));
+                return [
+                    { point: this.p1, type: 'endpoint' },
+                    { point: this.p2, type: 'endpoint' },
+                    { point: midPt, type: 'midpoint' },
+                    { point: this.center, type: 'center' }
+                ];
+            }
+            draw(ctx, selected = false) {
+                if (!this.valid) return;
+                if (selected) { ctx.strokeStyle = '#00bfff'; ctx.lineWidth = 3 / zoom; }
+                ctx.beginPath();
+                if (this.counterClockwise) {
+                    ctx.arc(this.center.x, this.center.y, this.radius, this.startAngle, this.endAngle, false);
+                } else {
+                    ctx.arc(this.center.x, this.center.y, this.radius, this.startAngle, this.endAngle, true);
+                }
+                ctx.stroke();
+            }
+            distanceToPoint(pt) {
+                if (!this.valid) return Infinity;
+                const angle = normalizeAngle(Math.atan2(pt.y - this.center.y, pt.x - this.center.x));
+                const onArc = this.counterClockwise ? angleInArc(angle, this.startAngle, this.endAngle)
+                                                    : angleInArc(angle, this.endAngle, this.startAngle);
+                if (onArc) return Math.abs(this.center.distanceTo(pt) - this.radius);
+                // Fora do arco: distância aos endpoints
+                return Math.min(pt.distanceTo(this.p1), pt.distanceTo(this.p2));
+            }
+            isFullyInside(xMin, xMax, yMin, yMax) {
+                if (!this.valid) return false;
+                return this.p1.x >= xMin && this.p1.x <= xMax && this.p1.y >= yMin && this.p1.y <= yMax &&
+                       this.p2.x >= xMin && this.p2.x <= xMax && this.p2.y >= yMin && this.p2.y <= yMax &&
+                       this.p3.x >= xMin && this.p3.x <= xMax && this.p3.y >= yMin && this.p3.y <= yMax;
+            }
+            intersectsBox(xMin, xMax, yMin, yMax) {
+                if (this.isFullyInside(xMin, xMax, yMin, yMax)) return true;
+                if (this.distanceToPoint(new Point(Math.max(xMin, Math.min(this.center.x, xMax)),
+                                                    Math.max(yMin, Math.min(this.center.y, yMax)))) <= this.radius + 0.01) return true;
+                return false;
+            }
+        }
+
         // --- 2. ESTADO GLOBAL ---
         const canvas = document.getElementById('cadCanvas');
         const ctx = canvas.getContext('2d');
@@ -225,7 +326,8 @@
         let selectedShapes = []; 
         let moveBasePoint = null;
         let offsetDistance = 50;
-        let selectionPhase = "select"; // "select" ou "basepoint" ou "target"
+        let selectionPhase = "select"; // "select" | "basepoint" | "target" | "axis1" | "axis2"
+        let mirrorAxisP1 = null;
 
         let selectionStartPt = null; 
         let isSelectingBox = false;
@@ -272,7 +374,7 @@
             activeSnap = null; currentPolarAngle = null;
 
             // Desativa snap APENAS na fase de seleção pura da caixa
-            if (isSelectingBox || (currentMode === 'move' && selectionPhase === 'select') || ['trim', 'offset', 'delete'].includes(currentMode)) {
+            if (isSelectingBox || (currentMode === 'move' && selectionPhase === 'select') || (currentMode === 'mirror' && selectionPhase === 'select') || ['trim', 'offset', 'delete'].includes(currentMode)) {
                 computedPt = modelMouse; return;
             }
 
@@ -296,8 +398,8 @@
             });
 
             let polarActiveLine = null;
-            if (currentPoints.length > 0 || (currentMode === 'move' && moveBasePoint)) {
-                const basePt = currentPoints.length > 0 ? currentPoints[currentPoints.length - 1] : moveBasePoint;
+            if (currentPoints.length > 0 || (currentMode === 'move' && moveBasePoint) || (currentMode === 'mirror' && mirrorAxisP1)) {
+                const basePt = currentPoints.length > 0 ? currentPoints[currentPoints.length - 1] : (currentMode === 'mirror' ? mirrorAxisP1 : moveBasePoint);
                 let angle = Math.atan2(modelMouse.y - basePt.y, modelMouse.x - basePt.x);
                 if (angle < 0) angle += 2 * Math.PI;
 
@@ -361,21 +463,133 @@
         function clearSelection() { selectedShapes = []; selectionPhase = "select"; document.getElementById('select-count').innerText = 0; drawEverything(); }
 
         // --- 5. COMANDOS ---
-        function runTrim(clickPt) {
-            let segmentToTrim = null; let minD = 12 / zoom;
-            let physicalSegments = getAllPhysicalSegments();
-            physicalSegments.forEach(seg => {
-                let d = seg.distanceToPoint(clickPt); if (d < minD) { minD = d; segmentToTrim = seg; }
-            });
-            if (!segmentToTrim) return;
 
-            let splitPoints = []; let allSegs = getAllPhysicalSegments();
-            allSegs.forEach(s => {
+        // Interseção linha-segmento × círculo completo → pontos no segmento
+        function lineCircleIntersections(p1, p2, center, radius) {
+            const dx = p2.x - p1.x, dy = p2.y - p1.y;
+            const fx = p1.x - center.x, fy = p1.y - center.y;
+            const a = dx*dx + dy*dy;
+            if (a < 1e-12) return [];
+            const b = 2*(fx*dx + fy*dy);
+            const c = fx*fx + fy*fy - radius*radius;
+            const disc = b*b - 4*a*c;
+            if (disc < 0) return [];
+            const sqrtD = Math.sqrt(disc);
+            const results = [];
+            const t1 = (-b - sqrtD) / (2*a);
+            const t2 = (-b + sqrtD) / (2*a);
+            if (t1 >= -1e-9 && t1 <= 1+1e-9) results.push(new Point(p1.x + t1*dx, p1.y + t1*dy));
+            if (disc > 1e-10 && t2 >= -1e-9 && t2 <= 1+1e-9) results.push(new Point(p1.x + t2*dx, p1.y + t2*dy));
+            return results;
+        }
+
+        // Interseção círculo × círculo → pontos brutos (filtrar depois para arcos)
+        function circleCircleIntersections(c1, r1, c2, r2) {
+            const d = c1.distanceTo(c2);
+            if (d > r1 + r2 + 1e-9 || d < Math.abs(r1 - r2) - 1e-9 || d < 1e-9) return [];
+            const a = (r1*r1 - r2*r2 + d*d) / (2*d);
+            const h2 = r1*r1 - a*a;
+            if (h2 < 0) return [];
+            const h = Math.sqrt(h2);
+            const mx = c1.x + a*(c2.x - c1.x)/d;
+            const my = c1.y + a*(c2.y - c1.y)/d;
+            if (h < 1e-9) return [new Point(mx, my)];
+            const px = h*(c2.y - c1.y)/d;
+            const py = h*(c2.x - c1.x)/d;
+            return [new Point(mx + px, my - py), new Point(mx - px, my + py)];
+        }
+
+        // Filtra pontos que caem sobre um arco (respeitando direção)
+        function filterPointsOnArc(pts, arc) {
+            return pts.filter(p => {
+                const a = normalizeAngle(Math.atan2(p.y - arc.center.y, p.x - arc.center.x));
+                return arc.counterClockwise ? angleInArc(a, arc.startAngle, arc.endAngle)
+                                            : angleInArc(a, arc.endAngle, arc.startAngle);
+            });
+        }
+
+        // Verifica se dois ângulos são próximos (tolerância angular)
+        function anglesClose(a, b, eps = 0.005) {
+            const d = normalizeAngle(a - b);
+            return d < eps || d > 2*Math.PI - eps;
+        }
+
+        // Cria um Arc a partir de centro/raio/ângulos — usado pelo trim
+        function makeArcFromAngles(center, radius, startAngle, endAngle, counterClockwise) {
+            let midAngle;
+            if (counterClockwise) {
+                const span = normalizeAngle(endAngle - startAngle);
+                midAngle = normalizeAngle(startAngle + span / 2);
+            } else {
+                const span = normalizeAngle(startAngle - endAngle);
+                midAngle = normalizeAngle(endAngle + span / 2);
+            }
+            const p1 = new Point(center.x + radius * Math.cos(startAngle), center.y + radius * Math.sin(startAngle));
+            const p2 = new Point(center.x + radius * Math.cos(endAngle),   center.y + radius * Math.sin(endAngle));
+            const p3 = new Point(center.x + radius * Math.cos(midAngle),    center.y + radius * Math.sin(midAngle));
+            return new Arc(p1, p3, p2);
+        }
+
+        // Coleta ângulos de interseção de um arco/círculo com todos os outros shapes
+        function collectCircleIntersectionAngles(targetId, center, radius, isArc, startA, endA, ccw) {
+            let angles = [];
+            shapes.forEach(other => {
+                if (other.id === targetId) return;
+                let pts = [];
+                if (other instanceof Line) {
+                    pts = lineCircleIntersections(other.p1, other.p2, center, radius);
+                } else if (other instanceof Circle) {
+                    pts = circleCircleIntersections(center, radius, other.center, other.radius);
+                } else if (other instanceof Arc && other.valid) {
+                    pts = circleCircleIntersections(center, radius, other.center, other.radius);
+                    pts = filterPointsOnArc(pts, other);
+                }
+                // Se for arco (não círculo completo), filtrar ao trecho do arco
+                if (isArc) {
+                    pts = pts.filter(p => {
+                        const a = normalizeAngle(Math.atan2(p.y - center.y, p.x - center.x));
+                        const onArc = ccw ? angleInArc(a, startA, endA) : angleInArc(a, endA, startA);
+                        return onArc && !anglesClose(a, startA) && !anglesClose(a, endA);
+                    });
+                }
+                pts.forEach(p => {
+                    const a = normalizeAngle(Math.atan2(p.y - center.y, p.x - center.x));
+                    if (!angles.some(ia => anglesClose(ia, a))) angles.push(a);
+                });
+            });
+            return angles;
+        }
+
+        // TRIM em Linha/Polyline (lógica original + intersecções com arcos/círculos)
+        function runTrimLine(segmentToTrim, clickPt) {
+            let splitPoints = [];
+            // Linha × linhas
+            getAllPhysicalSegments().forEach(s => {
+                const same = (s.p1 === segmentToTrim.p1 && s.p2 === segmentToTrim.p2);
+                if (same) return;
                 let inter = findLineIntersection(segmentToTrim.p1, segmentToTrim.p2, s.p1, s.p2, true);
-                if (inter && inter.distanceTo(segmentToTrim.p1) > 0.01 && inter.distanceTo(segmentToTrim.p2) > 0.01) splitPoints.push(inter);
+                if (inter && inter.distanceTo(segmentToTrim.p1) > 0.01 && inter.distanceTo(segmentToTrim.p2) > 0.01) {
+                    if (!splitPoints.some(sp => sp.distanceTo(inter) < 0.01)) splitPoints.push(inter);
+                }
+            });
+            // Linha × arcos e círculos
+            shapes.forEach(shape => {
+                let pts = [];
+                if (shape instanceof Circle) {
+                    pts = lineCircleIntersections(segmentToTrim.p1, segmentToTrim.p2, shape.center, shape.radius);
+                } else if (shape instanceof Arc && shape.valid) {
+                    pts = lineCircleIntersections(segmentToTrim.p1, segmentToTrim.p2, shape.center, shape.radius);
+                    pts = filterPointsOnArc(pts, shape);
+                }
+                pts.forEach(pt => {
+                    if (pt.distanceTo(segmentToTrim.p1) > 0.01 && pt.distanceTo(segmentToTrim.p2) > 0.01) {
+                        if (!splitPoints.some(sp => sp.distanceTo(pt) < 0.01)) splitPoints.push(pt);
+                    }
+                });
             });
 
-            let p1 = segmentToTrim.p1; splitPoints.sort((a, b) => p1.distanceTo(a) - p1.distanceTo(b));
+            const p1 = segmentToTrim.p1;
+            splitPoints.sort((a, b) => p1.distanceTo(a) - p1.distanceTo(b));
             let subSegments = []; let currentStart = p1;
             splitPoints.forEach(pt => { subSegments.push(new Line(currentStart, pt)); currentStart = pt; });
             subSegments.push(new Line(currentStart, segmentToTrim.p2));
@@ -386,6 +600,97 @@
                 subSegments.splice(indexToRemove, 1);
                 shapes = shapes.filter(s => s.id !== segmentToTrim.id);
                 subSegments.forEach(sub => shapes.push(sub));
+            }
+        }
+
+        // TRIM em Arco → divide o arco, remove o trecho clicado
+        function runTrimArcShape(arc, clickPt) {
+            if (!arc.valid) return;
+            const ccw = arc.counterClockwise;
+            const startA = arc.startAngle, endA = arc.endAngle;
+
+            let interAngles = collectCircleIntersectionAngles(arc.id, arc.center, arc.radius, true, startA, endA, ccw);
+            if (interAngles.length === 0) return;
+
+            // Ordena pela distância angular a partir de startA na direção do arco
+            interAngles.sort((a, b) => {
+                const da = ccw ? normalizeAngle(a - startA) : normalizeAngle(startA - a);
+                const db = ccw ? normalizeAngle(b - startA) : normalizeAngle(startA - b);
+                return da - db;
+            });
+
+            const bounds = [startA, ...interAngles, endA];
+            const clickAngle = normalizeAngle(Math.atan2(clickPt.y - arc.center.y, clickPt.x - arc.center.x));
+
+            let indexToRemove = -1;
+            for (let i = 0; i < bounds.length - 1; i++) {
+                const sa = bounds[i], ea = bounds[i+1];
+                const inSub = ccw ? angleInArc(clickAngle, sa, ea) : angleInArc(clickAngle, ea, sa);
+                if (inSub) { indexToRemove = i; break; }
+            }
+            if (indexToRemove === -1) return;
+
+            shapes = shapes.filter(s => s.id !== arc.id);
+            for (let i = 0; i < bounds.length - 1; i++) {
+                if (i !== indexToRemove)
+                    shapes.push(makeArcFromAngles(arc.center, arc.radius, bounds[i], bounds[i+1], ccw));
+            }
+        }
+
+        // TRIM em Círculo → converte em arcos, remove o trecho clicado
+        function runTrimCircle(circle, clickPt) {
+            let angles = collectCircleIntersectionAngles(circle.id, circle.center, circle.radius, false);
+            if (angles.length === 0) return;
+
+            angles.sort((a, b) => a - b); // ordena 0 → 2π
+            const n = angles.length;
+            const clickAngle = normalizeAngle(Math.atan2(clickPt.y - circle.center.y, clickPt.x - circle.center.x));
+
+            let indexToRemove = -1;
+            for (let i = 0; i < n; i++) {
+                const sa = angles[i];
+                const ea = angles[(i + 1) % n];
+                if (angleInArc(clickAngle, sa, ea)) { indexToRemove = i; break; }
+            }
+            if (indexToRemove === -1) return;
+
+            shapes = shapes.filter(s => s.id !== circle.id);
+            for (let i = 0; i < n; i++) {
+                if (i !== indexToRemove) {
+                    const sa = angles[i];
+                    const ea = angles[(i + 1) % n];
+                    shapes.push(makeArcFromAngles(circle.center, circle.radius, sa, ea, true));
+                }
+            }
+        }
+
+        // TRIM principal — detecta o tipo do shape clicado e delega
+        function runTrim(clickPt) {
+            const threshold = 12 / zoom;
+
+            // Testa arcos e círculos (shapes diretos)
+            let curvedShape = null, minCurved = threshold;
+            shapes.forEach(shape => {
+                if (shape instanceof Arc || shape instanceof Circle) {
+                    const d = shape.distanceToPoint(clickPt);
+                    if (d < minCurved) { minCurved = d; curvedShape = shape; }
+                }
+            });
+
+            // Testa segmentos de linha/polyline
+            let segmentToTrim = null, minSeg = threshold;
+            getAllPhysicalSegments().forEach(seg => {
+                const d = seg.distanceToPoint(clickPt);
+                if (d < minSeg) { minSeg = d; segmentToTrim = seg; }
+            });
+
+            // Escolhe o mais próximo
+            if (segmentToTrim && minSeg <= minCurved) {
+                runTrimLine(segmentToTrim, clickPt);
+            } else if (curvedShape instanceof Circle) {
+                runTrimCircle(curvedShape, clickPt);
+            } else if (curvedShape instanceof Arc) {
+                runTrimArcShape(curvedShape, clickPt);
             }
         }
 
@@ -404,6 +709,47 @@
                 if (shape instanceof Line) { shape.p1.x += dx; shape.p1.y += dy; shape.p2.x += dx; shape.p2.y += dy; }
                 else if (shape instanceof Circle) { shape.center.x += dx; shape.center.y += dy; }
                 else if (shape instanceof Polyline) { shape.points.forEach(p => { p.x += dx; p.y += dy; }); }
+                else if (shape instanceof Arc) {
+                    shape.p1.x += dx; shape.p1.y += dy;
+                    shape.p2.x += dx; shape.p2.y += dy;
+                    shape.p3.x += dx; shape.p3.y += dy;
+                    shape._compute();
+                }
+            });
+        }
+
+        // Reflete um ponto sobre o eixo definido por axisP1→axisP2
+        function mirrorPoint(pt, axisP1, axisP2) {
+            const dx = axisP2.x - axisP1.x, dy = axisP2.y - axisP1.y;
+            const len2 = dx*dx + dy*dy;
+            if (len2 < 1e-12) return new Point(pt.x, pt.y);
+            const t = ((pt.x - axisP1.x)*dx + (pt.y - axisP1.y)*dy) / len2;
+            const fx = axisP1.x + t*dx, fy = axisP1.y + t*dy;
+            return new Point(2*fx - pt.x, 2*fy - pt.y);
+        }
+
+        // Cria uma cópia espelhada de um shape (não destrói o original)
+        function mirrorShape(shape, axisP1, axisP2) {
+            const mp = pt => mirrorPoint(pt, axisP1, axisP2);
+            if (shape instanceof Line) {
+                return new Line(mp(shape.p1), mp(shape.p2));
+            } else if (shape instanceof Circle) {
+                return new Circle(mp(shape.center), shape.radius);
+            } else if (shape instanceof Polyline) {
+                return new Polyline(shape.points.map(mp));
+            } else if (shape instanceof Arc) {
+                // Reflexão inverte a orientação: p1↔p1, p2↔p2, p3↔p3
+                // Após reflexão, a direção do arco fica invertida, por isso trocamos p1/p2
+                const mp1 = mp(shape.p1), mp2 = mp(shape.p2), mp3 = mp(shape.p3);
+                return new Arc(mp2, mp3, mp1); // troca endpoints para preservar curvatura
+            }
+            return null;
+        }
+
+        function applyMirror(items, axisP1, axisP2) {
+            items.forEach(shape => {
+                const mirrored = mirrorShape(shape, axisP1, axisP2);
+                if (mirrored) shapes.push(mirrored);
             });
         }
 
@@ -424,6 +770,11 @@
                 // Se estiver no MOVE e apertar Enter após selecionar, avança de fase
                 if (currentMode === 'move' && selectionPhase === 'select' && selectedShapes.length > 0) {
                     selectionPhase = "basepoint";
+                    updateInstructions(); drawEverything(); return;
+                }
+                // Se estiver no MIRROR e apertar Enter após selecionar, avança de fase
+                if (currentMode === 'mirror' && selectionPhase === 'select' && selectedShapes.length > 0) {
+                    selectionPhase = "axis1";
                     updateInstructions(); drawEverything(); return;
                 }
                 processCommand(); return;
@@ -495,6 +846,28 @@
                 }
             }
 
+            // FLUXO DO MIRROR
+            if (currentMode === 'mirror') {
+                if (selectionPhase === 'select') {
+                    const clickedShape = getShapeUnderMouse(pureModelMouse);
+                    if (clickedShape) {
+                        if (!selectedShapes.some(s => s.id === clickedShape.id)) selectedShapes.push(clickedShape);
+                        document.getElementById('select-count').innerText = selectedShapes.length;
+                    } else {
+                        isSelectingBox = true; selectionStartPt = pureModelMouse;
+                    }
+                    updateInstructions(); drawEverything(); return;
+                } else if (selectionPhase === 'axis1') {
+                    mirrorAxisP1 = snapClickModel;
+                    selectionPhase = 'axis2';
+                    updateInstructions(); drawEverything(); return;
+                } else if (selectionPhase === 'axis2') {
+                    applyMirror(selectedShapes, mirrorAxisP1, snapClickModel);
+                    mirrorAxisP1 = null;
+                    clearSelection(); resetState(); return;
+                }
+            }
+
             // OUTROS MODOS DE EDICÃO
             if (currentMode === 'delete') {
                 let clickedShape = getShapeUnderMouse(pureModelMouse);
@@ -513,7 +886,7 @@
             }
 
             // MODOS DE DESENHO
-            if (['line', 'polyline', 'circle'].includes(currentMode)) {
+            if (['line', 'polyline', 'circle', 'arc'].includes(currentMode)) {
                 addPointToCreation(snapClickModel);
             }
         });
@@ -536,6 +909,14 @@
             } else if (currentMode === 'circle') {
                 if (currentPoints.length === 0) currentPoints.push(pt);
                 else { shapes.push(new Circle(currentPoints[0], currentPoints[0].distanceTo(pt))); currentPoints = []; }
+            } else if (currentMode === 'arc') {
+                // 3 cliques: [0]=início, [1]=fim, [2]=ponto intermediário
+                currentPoints.push(pt);
+                if (currentPoints.length === 3) {
+                    const arc = new Arc(currentPoints[0], currentPoints[2], currentPoints[1]);
+                    if (arc.valid) shapes.push(arc);
+                    currentPoints = [];
+                }
             }
             drawEverything();
         }
@@ -550,7 +931,7 @@
         }
 
         function resetState() {
-            currentPoints = []; moveBasePoint = null; trackedPoints = []; isSelectingBox = false; selectionPhase = "select";
+            currentPoints = []; moveBasePoint = null; mirrorAxisP1 = null; trackedPoints = []; isSelectingBox = false; selectionPhase = "select";
             updateInstructions(); drawEverything();
         }
 
@@ -560,6 +941,11 @@
             let inst = ""; let lbl = "Distância / Coord:";
             if (currentMode === 'line' || currentMode === 'circle') inst = "Clique na tela para iniciar o desenho gráfico.";
             else if (currentMode === 'polyline') inst = "Clique nos pontos consecutivos. Aperte ENTER para finalizar a Polyline.";
+            else if (currentMode === 'arc') {
+                if (currentPoints.length === 0) inst = "[Arco 1/3] Clique no PONTO INICIAL do arco.";
+                else if (currentPoints.length === 1) inst = "[Arco 2/3] Clique no PONTO FINAL do arco.";
+                else inst = "[Arco 3/3] Clique em um ponto intermediário para definir a curvatura.";
+            }
             else if (currentMode === 'trim') inst = "Clique nas pontas sobressalentes para cortar.";
             else if (currentMode === 'offset') inst = `Digite a distância e dê Enter [Atual: ${offsetDistance}]. Clique na linha.`;
             else if (currentMode === 'delete') inst = "Clique no objeto ou abra uma caixa de seleção para apagar.";
@@ -567,6 +953,11 @@
                 if (selectionPhase === "select") inst = `[Fase 1: Seleção] Selecione os objetos desejados. Quando terminar, aperte ENTER.`;
                 else if (selectionPhase === "basepoint") inst = `[Fase 2: Origem] Clique em cima de um SNAP do objeto para usar como PONTO BASE.`;
                 else inst = "Mova o mouse e clique no ponto de DESTINO (ou digite o tamanho + Enter).";
+            }
+            else if (currentMode === 'mirror') {
+                if (selectionPhase === "select") inst = `[Mirror 1/3] Selecione os objetos a espelhar e aperte ENTER.`;
+                else if (selectionPhase === "axis1") inst = `[Mirror 2/3] Clique no 1º ponto do EIXO DE ESPELHAMENTO.`;
+                else inst = `[Mirror 3/3] Clique no 2º ponto do eixo para concluir o espelhamento.`;
             }
             document.getElementById('instruction-display').innerText = inst;
             document.getElementById('prompt-label').innerText = lbl;
@@ -608,12 +999,46 @@
             // ELÁSTICOS DE DESENHO
             ctx.strokeStyle = '#aaaaaa'; ctx.lineWidth = 1 / zoom; ctx.setLineDash([4 / zoom, 4 / zoom]);
             if (currentPoints.length > 0) {
-                if (currentMode === 'line') { ctx.beginPath(); ctx.moveTo(currentPoints[0].x, currentPoints[0].y); ctx.lineTo(computedPt.x, computedPt.y); ctx.stroke(); }
-                else if (currentMode === 'polyline') {
+                if (currentMode === 'line') {
+                    ctx.beginPath(); ctx.moveTo(currentPoints[0].x, currentPoints[0].y); ctx.lineTo(computedPt.x, computedPt.y); ctx.stroke();
+                } else if (currentMode === 'polyline') {
                     ctx.beginPath(); ctx.moveTo(currentPoints[0].x, currentPoints[0].y);
                     for(let i=1; i<currentPoints.length; i++) ctx.lineTo(currentPoints[i].x, currentPoints[i].y);
                     ctx.lineTo(computedPt.x, computedPt.y); ctx.stroke();
-                } else if (currentMode === 'circle') { ctx.beginPath(); ctx.arc(currentPoints[0].x, currentPoints[0].y, currentPoints[0].distanceTo(computedPt), 0, 2*Math.PI); ctx.stroke(); }
+                } else if (currentMode === 'circle') {
+                    ctx.beginPath(); ctx.arc(currentPoints[0].x, currentPoints[0].y, currentPoints[0].distanceTo(computedPt), 0, 2*Math.PI); ctx.stroke();
+                } else if (currentMode === 'arc') {
+                    // Preview: ponto inicial já definido
+                    if (currentPoints.length >= 1) {
+                        // Marca o ponto inicial com um X
+                        ctx.save(); ctx.setLineDash([]);
+                        ctx.strokeStyle = '#ff9900'; ctx.lineWidth = 2 / zoom;
+                        const s = 6 / zoom;
+                        ctx.beginPath(); ctx.moveTo(currentPoints[0].x - s, currentPoints[0].y - s); ctx.lineTo(currentPoints[0].x + s, currentPoints[0].y + s);
+                        ctx.moveTo(currentPoints[0].x + s, currentPoints[0].y - s); ctx.lineTo(currentPoints[0].x - s, currentPoints[0].y + s); ctx.stroke();
+                        ctx.restore();
+                        // Linha tracejada do p1 até o mouse
+                        ctx.beginPath(); ctx.moveTo(currentPoints[0].x, currentPoints[0].y); ctx.lineTo(computedPt.x, computedPt.y); ctx.stroke();
+                    }
+                    // Preview do arco com os 3 pontos (p1, mouse como p_mid, p2)
+                    if (currentPoints.length === 2) {
+                        // Linha tracejada do p2 até o mouse
+                        ctx.beginPath(); ctx.moveTo(currentPoints[1].x, currentPoints[1].y); ctx.lineTo(computedPt.x, computedPt.y); ctx.stroke();
+                        const previewArc = new Arc(currentPoints[0], computedPt, currentPoints[1]);
+                        if (previewArc.valid) {
+                            ctx.save(); ctx.setLineDash([4/zoom, 4/zoom]); ctx.strokeStyle = '#ff9900'; ctx.lineWidth = 1.5 / zoom;
+                            previewArc.draw(ctx, false);
+                            ctx.restore();
+                        }
+                        // Marca o ponto final com um X
+                        ctx.save(); ctx.setLineDash([]);
+                        ctx.strokeStyle = '#ff9900'; ctx.lineWidth = 2 / zoom;
+                        const s = 6 / zoom;
+                        ctx.beginPath(); ctx.moveTo(currentPoints[1].x - s, currentPoints[1].y - s); ctx.lineTo(currentPoints[1].x + s, currentPoints[1].y + s);
+                        ctx.moveTo(currentPoints[1].x + s, currentPoints[1].y - s); ctx.lineTo(currentPoints[1].x - s, currentPoints[1].y + s); ctx.stroke();
+                        ctx.restore();
+                    }
+                }
             }
             
             // PREVIEW DE MOVE EM LOTE
@@ -623,9 +1048,53 @@
                 ctx.save(); ctx.translate(dx, dy); selectedShapes.forEach(s => s.draw(ctx, false)); ctx.restore();
             }
 
+            // PREVIEW DE MIRROR
+            if (currentMode === 'mirror') {
+                if (selectionPhase === 'axis2' && mirrorAxisP1) {
+                    const axisEnd = computedPt;
+                    // Eixo de espelhamento (linha extendida)
+                    ctx.save();
+                    ctx.setLineDash([6/zoom, 4/zoom]);
+                    ctx.strokeStyle = '#ff44ff'; ctx.lineWidth = 1.5 / zoom;
+                    const dx = axisEnd.x - mirrorAxisP1.x, dy = axisEnd.y - mirrorAxisP1.y;
+                    const len = Math.hypot(dx, dy) || 1;
+                    const ext = 10000;
+                    ctx.beginPath();
+                    ctx.moveTo(mirrorAxisP1.x - (dx/len)*ext, mirrorAxisP1.y - (dy/len)*ext);
+                    ctx.lineTo(axisEnd.x   + (dx/len)*ext, axisEnd.y   + (dy/len)*ext);
+                    ctx.stroke();
+                    ctx.restore();
+                    // Marcador do 1º ponto
+                    ctx.save(); ctx.setLineDash([]);
+                    ctx.strokeStyle = '#ff44ff'; ctx.lineWidth = 2/zoom;
+                    const s = 6/zoom;
+                    ctx.beginPath();
+                    ctx.moveTo(mirrorAxisP1.x-s, mirrorAxisP1.y-s); ctx.lineTo(mirrorAxisP1.x+s, mirrorAxisP1.y+s);
+                    ctx.moveTo(mirrorAxisP1.x+s, mirrorAxisP1.y-s); ctx.lineTo(mirrorAxisP1.x-s, mirrorAxisP1.y+s);
+                    ctx.stroke(); ctx.restore();
+                    // Ghost dos shapes espelhados
+                    ctx.save();
+                    ctx.setLineDash([3/zoom, 3/zoom]);
+                    ctx.strokeStyle = 'rgba(255, 100, 255, 0.55)'; ctx.lineWidth = 1.5 / zoom;
+                    selectedShapes.forEach(shape => {
+                        const mirrored = mirrorShape(shape, mirrorAxisP1, axisEnd);
+                        if (mirrored) mirrored.draw(ctx, false);
+                    });
+                    ctx.restore();
+                }
+                if (selectionPhase === 'axis1') {
+                    // Linha guia do eixo seguindo o mouse
+                    ctx.save();
+                    ctx.setLineDash([6/zoom, 4/zoom]);
+                    ctx.strokeStyle = '#ff44ff'; ctx.lineWidth = 1 / zoom;
+                    ctx.beginPath(); ctx.moveTo(computedPt.x - 10000, computedPt.y); ctx.lineTo(computedPt.x + 10000, computedPt.y); ctx.stroke();
+                    ctx.restore();
+                }
+            }
+
             // POLAR
-            if (currentPolarAngle !== null && !activeSnap && (currentPoints.length > 0 || (currentMode === 'move' && selectionPhase === 'target' && moveBasePoint))) {
-                let bp = currentPoints.length > 0 ? currentPoints[currentPoints.length - 1] : moveBasePoint;
+            if (currentPolarAngle !== null && !activeSnap && (currentPoints.length > 0 || (currentMode === 'move' && selectionPhase === 'target' && moveBasePoint) || (currentMode === 'mirror' && selectionPhase === 'axis2' && mirrorAxisP1))) {
+                let bp = currentPoints.length > 0 ? currentPoints[currentPoints.length - 1] : (currentMode === 'mirror' ? mirrorAxisP1 : moveBasePoint);
                 ctx.strokeStyle = '#00bcff'; ctx.lineWidth = 1 / zoom; ctx.beginPath(); ctx.moveTo(bp.x, bp.y);
                 ctx.lineTo(bp.x + Math.cos(currentPolarAngle)*20000, bp.y + Math.sin(currentPolarAngle)*20000); ctx.stroke();
             }
