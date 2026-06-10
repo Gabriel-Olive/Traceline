@@ -320,7 +320,8 @@
         let isPanning = false; let startPan = { x: 0, y: 0 };
 
         let activeSnap = null;
-        let trackedPoints = []; 
+        let trackedPoints = [];
+        let activeOTrackLines = [];
 
         // Modificações e Seleção
         let selectedShapes = []; 
@@ -371,7 +372,7 @@
         function processCalculatedPoint() {
             const modelMouse = screenToModel(screenMousePos);
             const toleranceModel = SNAP_TOLERANCE_SCREEN / zoom;
-            activeSnap = null; currentPolarAngle = null;
+            activeSnap = null; currentPolarAngle = null; activeOTrackLines = [];
 
             // Desativa snap APENAS na fase de seleção pura da caixa
             if (isSelectingBox || (currentMode === 'move' && selectionPhase === 'select') || (currentMode === 'mirror' && selectionPhase === 'select') || ['trim', 'offset', 'delete'].includes(currentMode)) {
@@ -390,12 +391,13 @@
                 }
             }
 
-            // GUIAS VIRTUAIS
+            // GUIAS VIRTUAIS (OTrack)
             let virtualLines = [];
             trackedPoints.forEach(tPt => {
                 virtualLines.push({ p1: new Point(tPt.x - 10000, tPt.y), p2: new Point(tPt.x + 10000, tPt.y), origin: tPt, type: 'otrack' });
                 virtualLines.push({ p1: new Point(tPt.x, tPt.y - 10000), p2: new Point(tPt.x, tPt.y + 10000), origin: tPt, type: 'otrack' });
             });
+            activeOTrackLines = virtualLines.filter(l => l.type === 'otrack');
 
             let polarActiveLine = null;
             if (currentPoints.length > 0 || (currentMode === 'move' && moveBasePoint) || (currentMode === 'mirror' && mirrorAxisP1)) {
@@ -414,7 +416,7 @@
                 }
             }
 
-            // INTERSEÇÕES
+            // INTERSEÇÕES entre segmentos físicos
             let bestIntersection = null; let minDist = toleranceModel;
             let physicalSegments = getAllPhysicalSegments();
             for (let i = 0; i < physicalSegments.length; i++) {
@@ -425,8 +427,51 @@
                     }
                 }
             }
-
             if (bestIntersection) { activeSnap = bestIntersection; computedPt = bestIntersection.point; return; }
+
+            // OTRACK SNAP
+            if (trackedPoints.length > 0) {
+                // Interseção entre duas guias OTrack (H do tp0 × V do tp1 e vice-versa)
+                if (trackedPoints.length >= 2) {
+                    const tp0 = trackedPoints[0], tp1 = trackedPoints[1];
+                    const interHV = new Point(tp1.x, tp0.y);
+                    const interVH = new Point(tp0.x, tp1.y);
+                    if (modelMouse.distanceTo(interHV) < toleranceModel) {
+                        activeSnap = { point: interHV, type: 'interseção real' }; computedPt = interHV; return;
+                    }
+                    if (modelMouse.distanceTo(interVH) < toleranceModel) {
+                        activeSnap = { point: interVH, type: 'interseção real' }; computedPt = interVH; return;
+                    }
+                }
+                // Interseção entre guia OTrack e linha Polar ativa
+                if (polarActiveLine) {
+                    for (const tPt of trackedPoints) {
+                        const hInter = findLineIntersection(
+                            new Point(tPt.x - 10000, tPt.y), new Point(tPt.x + 10000, tPt.y),
+                            polarActiveLine.p1, polarActiveLine.p2
+                        );
+                        if (hInter && modelMouse.distanceTo(hInter) < toleranceModel) {
+                            activeSnap = { point: hInter, type: 'interseção real' }; computedPt = hInter; return;
+                        }
+                        const vInter = findLineIntersection(
+                            new Point(tPt.x, tPt.y - 10000), new Point(tPt.x, tPt.y + 10000),
+                            polarActiveLine.p1, polarActiveLine.p2
+                        );
+                        if (vInter && modelMouse.distanceTo(vInter) < toleranceModel) {
+                            activeSnap = { point: vInter, type: 'interseção real' }; computedPt = vInter; return;
+                        }
+                    }
+                }
+                // Snap direto à guia OTrack mais próxima (horizontal ou vertical)
+                let bestOtrackSnap = null, bestOtrackDist = toleranceModel;
+                trackedPoints.forEach(tPt => {
+                    const distH = Math.abs(modelMouse.y - tPt.y);
+                    if (distH < bestOtrackDist) { bestOtrackDist = distH; bestOtrackSnap = new Point(modelMouse.x, tPt.y); }
+                    const distV = Math.abs(modelMouse.x - tPt.x);
+                    if (distV < bestOtrackDist) { bestOtrackDist = distV; bestOtrackSnap = new Point(tPt.x, modelMouse.y); }
+                });
+                if (bestOtrackSnap) { computedPt = bestOtrackSnap; return; }
+            }
 
             if (polarActiveLine) {
                 let basePt = polarActiveLine.p1; let dist = basePt.distanceTo(modelMouse);
@@ -1108,6 +1153,28 @@
                 ctx.fillRect(selectionStartPt.x, selectionStartPt.y, endPt.x - selectionStartPt.x, endPt.y - selectionStartPt.y);
                 ctx.strokeRect(selectionStartPt.x, selectionStartPt.y, endPt.x - selectionStartPt.x, endPt.y - selectionStartPt.y);
                 ctx.setLineDash([]);
+            }
+
+            // OTRACK - renderiza as guias de rastreamento
+            if (activeOTrackLines.length > 0) {
+                ctx.save();
+                ctx.strokeStyle = '#00e5ff';
+                ctx.lineWidth = 1 / zoom;
+                ctx.setLineDash([8 / zoom, 4 / zoom]);
+                activeOTrackLines.forEach(vl => {
+                    ctx.beginPath(); ctx.moveTo(vl.p1.x, vl.p1.y); ctx.lineTo(vl.p2.x, vl.p2.y); ctx.stroke();
+                });
+                // Marcadores de cruz nos pontos rastreados
+                ctx.setLineDash([]);
+                ctx.lineWidth = 1.5 / zoom;
+                trackedPoints.forEach(tp => {
+                    const s = 6 / zoom;
+                    ctx.beginPath();
+                    ctx.moveTo(tp.x - s, tp.y); ctx.lineTo(tp.x + s, tp.y);
+                    ctx.moveTo(tp.x, tp.y - s); ctx.lineTo(tp.x, tp.y + s);
+                    ctx.stroke();
+                });
+                ctx.restore();
             }
 
             ctx.restore();
