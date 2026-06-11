@@ -60,6 +60,7 @@
                 <span class="label">Modificar</span>
                 <button id="btn-move" onclick="setMode('move')">Move</button>
                 <button id="btn-copy" onclick="setMode('copy')">Copy</button>
+                <button id="btn-rotate" onclick="setMode('rotate')">Rotate</button>
                 <button id="btn-offset" onclick="setMode('offset')">Offset</button>
                 <button id="btn-trim" onclick="setMode('trim')">Trim</button>
                 <button id="btn-extend" onclick="setMode('extend')">Extend</button>
@@ -354,6 +355,8 @@
         let mirrorAxisP1 = null;
         let copyBasePoint = null;
         let copyMode = "single"; // "single" | "multiple"
+        let rotateBasePoint = null;
+        let rotateAngle = null;
         let extendPhase = "boundary"; // "boundary" | "select"
         let extendBoundaries = []; // objetos que são limites
 
@@ -579,6 +582,7 @@
             if (isSelectingBox ||
                 (currentMode === 'move' && selectionPhase === 'select') ||
                 (currentMode === 'copy' && selectionPhase === 'select') ||
+                (currentMode === 'rotate' && selectionPhase === 'select') ||
                 (currentMode === 'mirror' && selectionPhase === 'select') ||
                 (currentMode === 'extend' && extendPhase === 'boundary') ||
                 ['trim', 'offset', 'delete'].includes(currentMode)) {
@@ -598,6 +602,8 @@
                 basePt = moveBasePoint;
             } else if (currentMode === 'copy' && copyBasePoint && selectionPhase === 'target') {
                 basePt = copyBasePoint;
+            } else if (currentMode === 'rotate' && rotateBasePoint && selectionPhase === 'target') {
+                basePt = rotateBasePoint;
             } else if (currentMode === 'mirror' && mirrorAxisP1 && selectionPhase === 'axis2') {
                 basePt = mirrorAxisP1;
             }
@@ -1157,6 +1163,61 @@
             return new Point(2*fx - pt.x, 2*fy - pt.y);
         }
 
+        // Rotaciona um ponto em torno de um centro
+        function rotatePoint(pt, center, angle) {
+            const cosA = Math.cos(angle);
+            const sinA = Math.sin(angle);
+            const dx = pt.x - center.x;
+            const dy = pt.y - center.y;
+            return new Point(
+                center.x + dx * cosA - dy * sinA,
+                center.y + dx * sinA + dy * cosA
+            );
+        }
+
+        // Cria uma cópia rotacionada de um shape
+        function rotateShape(shape, center, angle) {
+            const rp = pt => rotatePoint(pt, center, angle);
+            if (shape instanceof Line) {
+                return new Line(rp(shape.p1), rp(shape.p2));
+            } else if (shape instanceof Circle) {
+                return new Circle(rp(shape.center), shape.radius);
+            } else if (shape instanceof Polyline) {
+                return new Polyline(shape.points.map(rp));
+            } else if (shape instanceof Arc) {
+                const mp1 = rp(shape.p1), mp2 = rp(shape.p2), mp3 = rp(shape.p3);
+                return new Arc(mp1, mp3, mp2);
+            }
+            return null;
+        }
+
+        // Cria cópia rotacionada de todos os shapes selecionados
+        function applyRotateMultiple(items, center, angle) {
+            items.forEach(shape => {
+                const rotated = rotateShape(shape, center, angle);
+                if (rotated) shapes.push(rotated);
+            });
+        }
+
+        // Rotaciona shapes in-place (para Move mode)
+        function rotateShapesInPlace(items, center, angle) {
+            items.forEach(shape => {
+                if (shape instanceof Line) {
+                    shape.p1 = rotatePoint(shape.p1, center, angle);
+                    shape.p2 = rotatePoint(shape.p2, center, angle);
+                } else if (shape instanceof Circle) {
+                    shape.center = rotatePoint(shape.center, center, angle);
+                } else if (shape instanceof Polyline) {
+                    shape.points = shape.points.map(p => rotatePoint(p, center, angle));
+                } else if (shape instanceof Arc) {
+                    shape.p1 = rotatePoint(shape.p1, center, angle);
+                    shape.p2 = rotatePoint(shape.p2, center, angle);
+                    shape.p3 = rotatePoint(shape.p3, center, angle);
+                    shape._compute();
+                }
+            });
+        }
+
         // Cria uma cópia espelhada de um shape (não destrói o original)
         function mirrorShape(shape, axisP1, axisP2) {
             const mp = pt => mirrorPoint(pt, axisP1, axisP2);
@@ -1222,6 +1283,15 @@
                 if (currentMode === 'copy' && selectionPhase === 'target') {
                     clearSelection(); resetState(); return;
                 }
+                // Se estiver no ROTATE e apertar Enter após selecionar, avança
+                if (currentMode === 'rotate' && selectionPhase === 'select' && selectedShapes.length > 0) {
+                    selectionPhase = 'basepoint';
+                    updateInstructions(); drawEverything(); return;
+                }
+                // Se estiver no ROTATE e apertar Enter após rotação, finaliza
+                if (currentMode === 'rotate' && selectionPhase === 'target') {
+                    clearSelection(); resetState(); return;
+                }
                 // Se estiver no EXTEND e apertar Enter após selecionar limites, avança
                 if (currentMode === 'extend' && extendPhase === 'boundary') {
                     extendPhase = 'select';
@@ -1244,6 +1314,15 @@
 
             if (currentMode === 'offset' && !isNaN(parseFloat(val))) {
                 offsetDistance = Math.abs(parseFloat(val)); updateInstructions(); return;
+            }
+
+            // Rotate: digitar graus
+            if (currentMode === 'rotate' && selectionPhase === 'target' && rotateBasePoint && !isNaN(parseFloat(val))) {
+                const degrees = parseFloat(val);
+                const angle = degrees * Math.PI / 180;
+                applyRotateMultiple(selectedShapes, rotateBasePoint, angle);
+                rotateBasePoint = null; // resetar para permitir nova rotação
+                updateInstructions(); drawEverything(); return;
             }
 
             if (!val.includes(',')) {
@@ -1367,6 +1446,31 @@
                 }
             }
 
+            // FLUXO DO ROTATE
+            if (currentMode === 'rotate') {
+                if (selectionPhase === 'select') {
+                    const clickedShape = getShapeUnderMouse(pureModelMouse);
+                    if (clickedShape) {
+                        if (!selectedShapes.some(s => s.id === clickedShape.id)) selectedShapes.push(clickedShape);
+                        document.getElementById('select-count').innerText = selectedShapes.length;
+                    } else {
+                        isSelectingBox = true; selectionStartPt = pureModelMouse;
+                    }
+                    updateInstructions(); drawEverything(); return;
+                } else if (selectionPhase === 'basepoint') {
+                    rotateBasePoint = snapClickModel;
+                    selectionPhase = 'target';
+                    updateInstructions(); drawEverything(); return;
+                } else if (selectionPhase === 'target') {
+                    // Calcula ângulo de rotação
+                    const angle = Math.atan2(snapClickModel.y - rotateBasePoint.y, snapClickModel.x - rotateBasePoint.x);
+                    applyRotateMultiple(selectedShapes, rotateBasePoint, angle);
+                    // Permite múltiplas rotações consecutivas
+                    rotateBasePoint = snapClickModel;
+                    updateInstructions(); drawEverything(); return;
+                }
+            }
+
             // FLUXO DO EXTEND
             if (currentMode === 'extend') {
                 if (extendPhase === 'boundary') {
@@ -1451,7 +1555,7 @@
         }
 
         function resetState() {
-            currentPoints = []; moveBasePoint = null; mirrorAxisP1 = null; copyBasePoint = null; isSelectingBox = false; selectionPhase = "select";
+            currentPoints = []; moveBasePoint = null; mirrorAxisP1 = null; copyBasePoint = null; rotateBasePoint = null; isSelectingBox = false; selectionPhase = "select";
             extendBoundaries = []; extendPhase = "boundary";
             OTRACK.clear();
             trackedPoints = [];
@@ -1564,6 +1668,10 @@
                 if (selectionPhase === "select") inst = `[Copy 1/2] Selecione os objetos a copiar e aperte ENTER.`;
                 else inst = `Clique no ponto BASE e depois no DESTINO (cliques consecutivos = múltiplas cópias).`;
             }
+            else if (currentMode === 'rotate') {
+                if (selectionPhase === "select") inst = `[Rotate 1/2] Selecione os objetos a rotacionar e aperte ENTER.`;
+                else inst = `Clique no centro de rotação e depois na direção final (ou digite graus + Enter).`;
+            }
             else if (currentMode === 'extend') {
                 if (extendPhase === "boundary") inst = `[Extend 1/2] Selecione os objetos LIMITE e aperte ENTER.`;
                 else inst = `[Extend 2/2] Clique nos objetos a estender (perto da ponta a estender).`;
@@ -1664,6 +1772,28 @@
                 ctx.setLineDash([4/zoom, 3/zoom]);
                 let dx = computedPt.x - copyBasePoint.x; let dy = computedPt.y - copyBasePoint.y;
                 ctx.save(); ctx.translate(dx, dy); selectedShapes.forEach(s => s.draw(ctx, false)); ctx.restore();
+                ctx.setLineDash([]);
+            }
+
+            // PREVIEW DE ROTATE
+            if (currentMode === 'rotate' && selectionPhase === 'target' && rotateBasePoint) {
+                ctx.strokeStyle = '#ff8800'; ctx.lineWidth = 1.5 / zoom;
+                ctx.setLineDash([4/zoom, 3/zoom]);
+                // Linha do eixo de rotação
+                ctx.beginPath(); ctx.moveTo(rotateBasePoint.x, rotateBasePoint.y); ctx.lineTo(computedPt.x, computedPt.y); ctx.stroke();
+                // Círculo guia
+                const dist = rotateBasePoint.distanceTo(computedPt);
+                ctx.beginPath(); ctx.arc(rotateBasePoint.x, rotateBasePoint.y, dist, 0, 2*Math.PI); ctx.stroke();
+                // Ghost dos shapes rotacionados
+                const angle = Math.atan2(computedPt.y - rotateBasePoint.y, computedPt.x - rotateBasePoint.x);
+                ctx.save();
+                ctx.setLineDash([3/zoom, 3/zoom]);
+                ctx.strokeStyle = 'rgba(255, 136, 0, 0.55)'; ctx.lineWidth = 1.5 / zoom;
+                selectedShapes.forEach(shape => {
+                    const rotated = rotateShape(shape, rotateBasePoint, angle);
+                    if (rotated) rotated.draw(ctx, false);
+                });
+                ctx.restore();
                 ctx.setLineDash([]);
             }
 
