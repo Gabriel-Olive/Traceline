@@ -59,8 +59,10 @@
             <div>
                 <span class="label">Modificar</span>
                 <button id="btn-move" onclick="setMode('move')">Move</button>
+                <button id="btn-copy" onclick="setMode('copy')">Copy</button>
                 <button id="btn-offset" onclick="setMode('offset')">Offset</button>
                 <button id="btn-trim" onclick="setMode('trim')">Trim</button>
+                <button id="btn-extend" onclick="setMode('extend')">Extend</button>
                 <button id="btn-mirror" onclick="setMode('mirror')">Mirror</button>
                 <button id="btn-delete" onclick="setMode('delete')" style="background-color: #a23333;">Delete</button>
             </div>
@@ -68,7 +70,9 @@
 
         <button onclick="clearSelection()" style="background-color: #555;">Limpar Seleção</button>
         <button onclick="clearCanvas()" style="background-color: #222;">Limpar Tudo</button>
-        
+        <button onclick="saveDrawing()" style="background-color: #1a5a1a;">💾 Salvar</button>
+        <button onclick="loadDrawing()" style="background-color: #1a3a5a;">📂 Carregar</button>
+
         <div id="input-panel">
             <span style="font-size: 12px; color: #aaa;" id="prompt-label">Distância:</span>
             <input type="text" id="coord-input" placeholder="Digite e aperte Enter..." autocomplete="off">
@@ -133,40 +137,59 @@
         }
 
         class Polyline {
-            constructor(points) { this.points = [...points]; this.id = Math.random(); }
+            constructor(points) {
+                this.points = [...points];
+                this.id = Math.random().toString(36).substr(2, 9);
+            }
             getSnapPoints() {
                 const snaps = [];
-                this.points.forEach((p, idx) => {
-                    snaps.push({ point: p, type: 'endpoint' });
-                    if (idx < this.points.length - 1) {
-                        const next = this.points[idx + 1];
-                        snaps.push({ point: new Point((p.x + next.x)/2, (p.y + next.y)/2), type: 'midpoint' });
-                    }
-                });
+                const n = this.points.length;
+                if (n < 2) return snaps;
+                // Extremidades = endpoints
+                snaps.push({ point: this.points[0], type: 'endpoint' });
+                snaps.push({ point: this.points[n - 1], type: 'endpoint' });
+                // Vértices internos = vertex
+                for (let i = 1; i < n - 1; i++) {
+                    snaps.push({ point: this.points[i], type: 'vertex' });
+                }
+                // Midpoints dos segmentos
+                for (let i = 0; i < n - 1; i++) {
+                    const mid = new Point(
+                        (this.points[i].x + this.points[i + 1].x) / 2,
+                        (this.points[i].y + this.points[i + 1].y) / 2
+                    );
+                    snaps.push({ point: mid, type: 'midpoint' });
+                }
                 return snaps;
             }
             draw(ctx, selected = false) {
                 if (this.points.length < 2) return;
-                ctx.beginPath(); ctx.moveTo(this.points[0].x, this.points[0].y);
-                for(let i = 1; i < this.points.length; i++) ctx.lineTo(this.points[i].x, this.points[i].y);
-                if(selected) { ctx.strokeStyle = '#00bfff'; ctx.lineWidth = 3 / zoom; }
+                ctx.beginPath();
+                ctx.moveTo(this.points[0].x, this.points[0].y);
+                for (let i = 1; i < this.points.length; i++) {
+                    ctx.lineTo(this.points[i].x, this.points[i].y);
+                }
+                ctx.strokeStyle = selected ? '#00bfff' : '#ffffff';
+                ctx.lineWidth = selected ? 3 / zoom : 2 / zoom;
                 ctx.stroke();
             }
             distanceToPoint(pt) {
                 let minDist = Infinity;
                 for (let i = 0; i < this.points.length - 1; i++) {
-                    let segment = new Line(this.points[i], this.points[i+1]);
-                    minDist = Math.min(minDist, segment.distanceToPoint(pt));
+                    const seg = new Line(this.points[i], this.points[i + 1]);
+                    minDist = Math.min(minDist, seg.distanceToPoint(pt));
                 }
                 return minDist;
             }
             isFullyInside(xMin, xMax, yMin, yMax) {
-                return this.points.every(p => p.x >= xMin && p.x <= xMax && p.y >= yMin && p.y <= yMax);
+                return this.points.every(p =>
+                    p.x >= xMin && p.x <= xMax && p.y >= yMin && p.y <= yMax
+                );
             }
             intersectsBox(xMin, xMax, yMin, yMax) {
                 if (this.isFullyInside(xMin, xMax, yMin, yMax)) return true;
                 for (let i = 0; i < this.points.length - 1; i++) {
-                    let seg = new Line(this.points[i], this.points[i+1]);
+                    const seg = new Line(this.points[i], this.points[i + 1]);
                     if (seg.intersectsBox(xMin, xMax, yMin, yMax)) return true;
                 }
                 return false;
@@ -329,6 +352,10 @@
         let offsetDistance = 50;
         let selectionPhase = "select"; // "select" | "basepoint" | "target" | "axis1" | "axis2"
         let mirrorAxisP1 = null;
+        let copyBasePoint = null;
+        let copyMode = "single"; // "single" | "multiple"
+        let extendPhase = "boundary"; // "boundary" | "select"
+        let extendBoundaries = []; // objetos que são limites
 
         let selectionStartPt = null; 
         let isSelectingBox = false;
@@ -346,16 +373,19 @@
 
         function screenToModel(sPt) { return new Point((sPt.x - panX) / zoom, (sPt.y - panY) / zoom); }
 
-        // --- 3. PROCESSO DE ENGENHARIA SNAP ---
+        // --- 3. SISTEMA DE SNAP E OTRACK REESCRITO ---
+        
+        // Calcula interseção entre duas linhas (infinitas ou segmentos)
         function findLineIntersection(p1, p2, p3, p4, limitToSegments = false) {
             const denom = (p4.y - p3.y) * (p2.x - p1.x) - (p4.x - p3.x) * (p2.y - p1.y);
-            if (Math.abs(denom) < 0.0001) return null; 
+            if (Math.abs(denom) < 0.0001) return null;
             const ua = ((p4.x - p3.x) * (p1.y - p3.y) - (p4.y - p3.y) * (p1.x - p3.x)) / denom;
             const ub = ((p2.x - p1.x) * (p1.y - p3.y) - (p2.y - p1.y) * (p1.x - p3.x)) / denom;
             if (limitToSegments && (ua < 0 || ua > 1 || ub < 0 || ub > 1)) return null;
             return new Point(p1.x + ua * (p2.x - p1.x), p1.y + ua * (p2.y - p1.y));
         }
 
+        // Retorna todos os segmentos físicos do desenho
         function getAllPhysicalSegments() {
             let segments = [];
             shapes.forEach(shape => {
@@ -369,116 +399,213 @@
             return segments;
         }
 
-        function processCalculatedPoint() {
-            const modelMouse = screenToModel(screenMousePos);
-            const toleranceModel = SNAP_TOLERANCE_SCREEN / zoom;
-            activeSnap = null; currentPolarAngle = null; activeOTrackLines = [];
+        // Retorna todos os pontos de snap de todos os shapes
+        function getAllSnapPoints() {
+            const snaps = [];
+            shapes.forEach(shape => {
+                snaps.push(...shape.getSnapPoints());
+            });
+            return snaps;
+        }
 
-            // Desativa snap APENAS na fase de seleção pura da caixa
-            if (isSelectingBox || (currentMode === 'move' && selectionPhase === 'select') || (currentMode === 'mirror' && selectionPhase === 'select') || ['trim', 'offset', 'delete'].includes(currentMode)) {
-                computedPt = modelMouse; return;
-            }
+        // Distância de um ponto a uma linha infinita (não segmento)
+        function pointToInfiniteLineDist(pt, lineP1, lineP2) {
+            const A = pt.x - lineP1.x;
+            const B = pt.y - lineP1.y;
+            const C = lineP2.x - lineP1.x;
+            const D = lineP2.y - lineP1.y;
+            const dot = A * C + B * D;
+            const lenSq = C * C + D * D;
+            if (lenSq === 0) return pt.distanceTo(lineP1);
+            const proj = dot / lenSq;
+            const closestX = lineP1.x + proj * C;
+            const closestY = lineP1.y + proj * D;
+            return Math.hypot(pt.x - closestX, pt.y - closestY);
+        }
 
-            // SNAP DIRETO (Ativo no desenho e nas fases de Basepoint/Target do Move!)
-            for (const shape of shapes) {
-                for (const snap of shape.getSnapPoints()) {
-                    if (modelMouse.distanceTo(snap.point) < toleranceModel) {
-                        if (!trackedPoints.some(p => p.x === snap.point.x && p.y === snap.point.y) && trackedPoints.length < 2) {
-                            trackedPoints.push(snap.point);
-                        }
-                        activeSnap = { point: snap.point, type: snap.type }; computedPt = snap.point; return;
+        // Sistema OTrack - integrado com OSnap
+        const OTRACK = {
+            tracked: [],           // { point: Point }
+            maxTracked: 3,
+            computedPoint: null,
+            
+            // Adiciona ponto rastreado (evita duplicatas próximas)
+            addPoint(pt) {
+                const isDuplicate = this.tracked.some(t => t.point.distanceTo(pt) < 0.01);
+                if (!isDuplicate) {
+                    if (this.tracked.length >= this.maxTracked) {
+                        this.tracked.shift();
+                    }
+                    this.tracked.push({ point: new Point(pt.x, pt.y) });
+                }
+            },
+            
+            clear() {
+                this.tracked = [];
+                this.computedPoint = null;
+            },
+            
+            computePoint(modelMouse, basePt = null) {
+                const tolerance = SNAP_TOLERANCE_SCREEN / zoom;
+                
+                // Sempre constrói guias OTrack dos pontos rastreados
+                this._buildGuides();
+                
+                // 1. SNAP DIRETO (OSnap) - captura e rastreia
+                const allSnaps = getAllSnapPoints();
+                for (const snap of allSnaps) {
+                    if (modelMouse.distanceTo(snap.point) < tolerance) {
+                        this.addPoint(snap.point); // adiciona ao tracking
+                        this.computedPoint = snap.point;
+                        activeSnap = { point: snap.point, type: snap.type };
+                        currentPolarAngle = null;
+                        // Mantém as guias OTrack ativas!
+                        return;
                     }
                 }
-            }
-
-            // GUIAS VIRTUAIS (OTrack)
-            let virtualLines = [];
-            trackedPoints.forEach(tPt => {
-                virtualLines.push({ p1: new Point(tPt.x - 10000, tPt.y), p2: new Point(tPt.x + 10000, tPt.y), origin: tPt, type: 'otrack' });
-                virtualLines.push({ p1: new Point(tPt.x, tPt.y - 10000), p2: new Point(tPt.x, tPt.y + 10000), origin: tPt, type: 'otrack' });
-            });
-            activeOTrackLines = virtualLines.filter(l => l.type === 'otrack');
-
-            let polarActiveLine = null;
-            if (currentPoints.length > 0 || (currentMode === 'move' && moveBasePoint) || (currentMode === 'mirror' && mirrorAxisP1)) {
-                const basePt = currentPoints.length > 0 ? currentPoints[currentPoints.length - 1] : (currentMode === 'mirror' ? mirrorAxisP1 : moveBasePoint);
+                
+                // 2. INTERSEÇÕES entre guias OTrack (H de um × V de outro)
+                if (this.tracked.length >= 2) {
+                    const interPt = this._findGuideIntersections(modelMouse, tolerance);
+                    if (interPt) {
+                        this.computedPoint = interPt;
+                        activeSnap = null;
+                        currentPolarAngle = null;
+                        return;
+                    }
+                }
+                
+                // 3. PROJEÇÃO nas guias OTrack (H ou V mais próxima)
+                if (this.tracked.length > 0) {
+                    const projPt = this._findGuideProjection(modelMouse, tolerance);
+                    if (projPt) {
+                        this.computedPoint = projPt;
+                        activeSnap = null;
+                        currentPolarAngle = null;
+                        return;
+                    }
+                }
+                
+                // 4. POLAR - ângulos notáveis
+                if (basePt) {
+                    const polarAngle = this._findPolarAngle(modelMouse, basePt);
+                    if (polarAngle !== null) {
+                        const dist = basePt.distanceTo(modelMouse);
+                        this.computedPoint = new Point(
+                            basePt.x + dist * Math.cos(polarAngle),
+                            basePt.y + dist * Math.sin(polarAngle)
+                        );
+                        currentPolarAngle = polarAngle;
+                        activeSnap = null;
+                        return;
+                    }
+                }
+                
+                // 5. SEM SNAP
+                this.computedPoint = modelMouse;
+                currentPolarAngle = null;
+                activeSnap = null;
+            },
+            
+            // Constrói guias H/V de todos os pontos rastreados
+            _buildGuides() {
+                activeOTrackLines = [];
+                this.tracked.forEach((tp) => {
+                    activeOTrackLines.push({ p1: new Point(-50000, tp.point.y), p2: new Point(50000, tp.point.y) });
+                    activeOTrackLines.push({ p1: new Point(tp.point.x, -50000), p2: new Point(tp.point.x, 50000) });
+                });
+            },
+            
+            // Encontra interseções entre guias H/V de pontos diferentes
+            _findGuideIntersections(modelMouse, tolerance) {
+                let bestPt = null;
+                let bestDist = tolerance;
+                
+                for (let i = 0; i < this.tracked.length; i++) {
+                    for (let j = 0; j < this.tracked.length; j++) {
+                        if (i === j) continue;
+                        // H do ponto i × V do ponto j
+                        const inter = new Point(this.tracked[j].point.x, this.tracked[i].point.y);
+                        const dist = modelMouse.distanceTo(inter);
+                        if (dist < bestDist) {
+                            bestDist = dist;
+                            bestPt = inter;
+                        }
+                    }
+                }
+                return bestPt;
+            },
+            
+            // Projeção na guia H ou V mais próxima
+            _findGuideProjection(modelMouse, tolerance) {
+                let bestPt = null;
+                let bestDist = tolerance;
+                
+                for (const tp of this.tracked) {
+                    // Projeção na horizontal
+                    const distH = Math.abs(modelMouse.y - tp.point.y);
+                    if (distH < bestDist) {
+                        bestDist = distH;
+                        bestPt = new Point(modelMouse.x, tp.point.y);
+                    }
+                    // Projeção na vertical
+                    const distV = Math.abs(modelMouse.x - tp.point.x);
+                    if (distV < bestDist) {
+                        bestDist = distV;
+                        bestPt = new Point(tp.point.x, modelMouse.y);
+                    }
+                }
+                return bestPt;
+            },
+            
+            _findPolarAngle(modelMouse, basePt) {
                 let angle = Math.atan2(modelMouse.y - basePt.y, modelMouse.x - basePt.x);
                 if (angle < 0) angle += 2 * Math.PI;
-
-                for (let targetDeg of POLAR_ANGLES) {
-                    let targetRad = targetDeg * (Math.PI / 180);
+                for (const targetDeg of POLAR_ANGLES) {
+                    const targetRad = targetDeg * (Math.PI / 180);
                     let diff = Math.abs(angle - targetRad);
                     if (diff > Math.PI) diff = 2 * Math.PI - diff;
-                    if (diff < POLAR_TOLERANCE) {
-                        polarActiveLine = { p1: basePt, p2: new Point(basePt.x + Math.cos(targetRad)*10000, basePt.y + Math.sin(targetRad)*10000), type: 'polar', rad: targetRad };
-                        virtualLines.push(polarActiveLine); currentPolarAngle = targetRad; break;
-                    }
+                    if (diff < POLAR_TOLERANCE) return targetRad;
                 }
+                return null;
             }
+        };
 
-            // INTERSEÇÕES entre segmentos físicos
-            let bestIntersection = null; let minDist = toleranceModel;
-            let physicalSegments = getAllPhysicalSegments();
-            for (let i = 0; i < physicalSegments.length; i++) {
-                for (let j = i + 1; j < physicalSegments.length; j++) {
-                    let inter = findLineIntersection(physicalSegments[i].p1, physicalSegments[i].p2, physicalSegments[j].p1, physicalSegments[j].p2, true);
-                    if (inter && modelMouse.distanceTo(inter) < minDist) {
-                        minDist = modelMouse.distanceTo(inter); bestIntersection = { point: inter, type: "interseção real" };
-                    }
-                }
+        // Função de compatibilidade - chama o sistema novo
+        function processCalculatedPoint() {
+            const modelMouse = screenToModel(screenMousePos);
+            
+            // Desativa snap em modos de seleção/edição
+            if (isSelectingBox ||
+                (currentMode === 'move' && selectionPhase === 'select') ||
+                (currentMode === 'copy' && selectionPhase === 'select') ||
+                (currentMode === 'mirror' && selectionPhase === 'select') ||
+                (currentMode === 'extend' && extendPhase === 'boundary') ||
+                ['trim', 'offset', 'delete'].includes(currentMode)) {
+                computedPt = modelMouse;
+                OTRACK.computedPoint = modelMouse;
+                activeSnap = null;
+                currentPolarAngle = null;
+                activeOTrackLines = [];
+                return;
             }
-            if (bestIntersection) { activeSnap = bestIntersection; computedPt = bestIntersection.point; return; }
-
-            // OTRACK SNAP
-            if (trackedPoints.length > 0) {
-                // Interseção entre duas guias OTrack (H do tp0 × V do tp1 e vice-versa)
-                if (trackedPoints.length >= 2) {
-                    const tp0 = trackedPoints[0], tp1 = trackedPoints[1];
-                    const interHV = new Point(tp1.x, tp0.y);
-                    const interVH = new Point(tp0.x, tp1.y);
-                    if (modelMouse.distanceTo(interHV) < toleranceModel) {
-                        activeSnap = { point: interHV, type: 'interseção real' }; computedPt = interHV; return;
-                    }
-                    if (modelMouse.distanceTo(interVH) < toleranceModel) {
-                        activeSnap = { point: interVH, type: 'interseção real' }; computedPt = interVH; return;
-                    }
-                }
-                // Interseção entre guia OTrack e linha Polar ativa
-                if (polarActiveLine) {
-                    for (const tPt of trackedPoints) {
-                        const hInter = findLineIntersection(
-                            new Point(tPt.x - 10000, tPt.y), new Point(tPt.x + 10000, tPt.y),
-                            polarActiveLine.p1, polarActiveLine.p2
-                        );
-                        if (hInter && modelMouse.distanceTo(hInter) < toleranceModel) {
-                            activeSnap = { point: hInter, type: 'interseção real' }; computedPt = hInter; return;
-                        }
-                        const vInter = findLineIntersection(
-                            new Point(tPt.x, tPt.y - 10000), new Point(tPt.x, tPt.y + 10000),
-                            polarActiveLine.p1, polarActiveLine.p2
-                        );
-                        if (vInter && modelMouse.distanceTo(vInter) < toleranceModel) {
-                            activeSnap = { point: vInter, type: 'interseção real' }; computedPt = vInter; return;
-                        }
-                    }
-                }
-                // Snap direto à guia OTrack mais próxima (horizontal ou vertical)
-                let bestOtrackSnap = null, bestOtrackDist = toleranceModel;
-                trackedPoints.forEach(tPt => {
-                    const distH = Math.abs(modelMouse.y - tPt.y);
-                    if (distH < bestOtrackDist) { bestOtrackDist = distH; bestOtrackSnap = new Point(modelMouse.x, tPt.y); }
-                    const distV = Math.abs(modelMouse.x - tPt.x);
-                    if (distV < bestOtrackDist) { bestOtrackDist = distV; bestOtrackSnap = new Point(tPt.x, modelMouse.y); }
-                });
-                if (bestOtrackSnap) { computedPt = bestOtrackSnap; return; }
+            
+            // Determina ponto base para polar
+            let basePt = null;
+            if (currentPoints.length > 0) {
+                basePt = currentPoints[currentPoints.length - 1];
+            } else if (currentMode === 'move' && moveBasePoint && selectionPhase === 'target') {
+                basePt = moveBasePoint;
+            } else if (currentMode === 'copy' && copyBasePoint && selectionPhase === 'target') {
+                basePt = copyBasePoint;
+            } else if (currentMode === 'mirror' && mirrorAxisP1 && selectionPhase === 'axis2') {
+                basePt = mirrorAxisP1;
             }
-
-            if (polarActiveLine) {
-                let basePt = polarActiveLine.p1; let dist = basePt.distanceTo(modelMouse);
-                computedPt = new Point(basePt.x + dist * Math.cos(polarActiveLine.rad), basePt.y + dist * Math.sin(polarActiveLine.rad)); return;
-            }
-
-            computedPt = modelMouse;
+            
+            // Calcula usando o sistema novo
+            OTRACK.computePoint(modelMouse, basePt);
+            computedPt = OTRACK.computedPoint;
+            trackedPoints = OTRACK.tracked.map(t => t.point);
         }
 
         // --- 4. SELEÇÃO ---
@@ -739,6 +866,238 @@
             }
         }
 
+        // EXTEND - estende objetos até os limites selecionados
+        function runExtend(clickPt) {
+            const threshold = 12 / zoom;
+
+            // Encontra o shape clicado (linha ou polyline)
+            let shapeToExtend = null;
+            let minDist = threshold;
+            let isSegment = false;
+            let segmentIndex = -1;
+
+            // Testa linhas diretas
+            shapes.forEach(shape => {
+                if (extendBoundaries.some(b => b.id === shape.id)) return;
+                if (shape instanceof Line) {
+                    const d = shape.distanceToPoint(clickPt);
+                    if (d < minDist) {
+                        minDist = d;
+                        shapeToExtend = shape;
+                        isSegment = true;
+                    }
+                }
+            });
+
+            // Testa segmentos de polyline
+            shapes.forEach(shape => {
+                if (extendBoundaries.some(b => b.id === shape.id)) return;
+                if (shape instanceof Polyline) {
+                    for (let i = 0; i < shape.points.length - 1; i++) {
+                        const seg = new Line(shape.points[i], shape.points[i + 1]);
+                        const d = seg.distanceToPoint(clickPt);
+                        if (d < minDist) {
+                            minDist = d;
+                            shapeToExtend = shape;
+                            isSegment = false;
+                            segmentIndex = i;
+                        }
+                    }
+                }
+            });
+
+            // Testa arcos
+            shapes.forEach(shape => {
+                if (extendBoundaries.some(b => b.id === shape.id)) return;
+                if (shape instanceof Arc && shape.valid) {
+                    const d = shape.distanceToPoint(clickPt);
+                    if (d < minDist) {
+                        minDist = d;
+                        shapeToExtend = shape;
+                    }
+                }
+            });
+
+            if (!shapeToExtend) return;
+
+            // Coletar todos os segmentos dos limites
+            let boundarySegments = [];
+            extendBoundaries.forEach(boundary => {
+                if (boundary instanceof Line) {
+                    boundarySegments.push(boundary);
+                } else if (boundary instanceof Polyline) {
+                    for (let i = 0; i < boundary.points.length - 1; i++) {
+                        boundarySegments.push(new Line(boundary.points[i], boundary.points[i + 1]));
+                    }
+                } else if (boundary instanceof Arc && boundary.valid) {
+                    // Para arcos/círculos, usar aproximação por segmentos
+                    for (let a = 0; a < 2 * Math.PI; a += Math.PI / 12) {
+                        const p1 = new Point(boundary.center.x + boundary.radius * Math.cos(a),
+                                            boundary.center.y + boundary.radius * Math.sin(a));
+                        const p2 = new Point(boundary.center.x + boundary.radius * Math.cos(a + Math.PI / 12),
+                                            boundary.center.y + boundary.radius * Math.sin(a + Math.PI / 12));
+                        boundarySegments.push(new Line(p1, p2));
+                    }
+                }
+            });
+
+            if (boundarySegments.length === 0) return;
+
+            if (shapeToExtend instanceof Line) {
+                runExtendLine(shapeToExtend, clickPt, boundarySegments);
+            } else if (shapeToExtend instanceof Arc && shapeToExtend.valid) {
+                runExtendArc(shapeToExtend, clickPt, boundarySegments);
+            } else if (shapeToExtend instanceof Polyline && segmentIndex >= 0) {
+                runExtendPolylineSegment(shapeToExtend, segmentIndex, clickPt, boundarySegments);
+            }
+        }
+
+        function runExtendLine(lineToExtend, clickPt, boundarySegments) {
+            const distToP1 = lineToExtend.p1.distanceTo(clickPt);
+            const distToP2 = lineToExtend.p2.distanceTo(clickPt);
+            const endpointToMove = distToP1 < distToP2 ? lineToExtend.p1 : lineToExtend.p2;
+            const endpointToKeep = distToP1 < distToP2 ? lineToExtend.p2 : lineToExtend.p1;
+
+            const dirX = endpointToMove.x - endpointToKeep.x;
+            const dirY = endpointToMove.y - endpointToKeep.y;
+            const dirLen = Math.hypot(dirX, dirY);
+            if (dirLen < 0.01) return;
+            const dirNX = dirX / dirLen;
+            const dirNY = dirY / dirLen;
+
+            const extStart = new Point(endpointToKeep.x - dirX * 100, endpointToKeep.y - dirY * 100);
+            const extEnd = new Point(endpointToKeep.x + dirX * 100, endpointToKeep.y + dirY * 100);
+
+            let bestInter = null;
+            let bestDist = Infinity;
+
+            for (const boundary of boundarySegments) {
+                const inter = findLineIntersection(extStart, extEnd, boundary.p1, boundary.p2, true);
+                if (!inter) continue;
+
+                const proj = (inter.x - endpointToKeep.x) * dirNX + (inter.y - endpointToKeep.y) * dirNY;
+                
+                if (proj > dirLen * 0.99) {
+                    const dist = endpointToMove.distanceTo(inter);
+                    if (dist < bestDist) {
+                        bestDist = dist;
+                        bestInter = inter;
+                    }
+                }
+            }
+
+            if (bestInter) {
+                if (distToP1 < distToP2) {
+                    lineToExtend.p1 = bestInter;
+                } else {
+                    lineToExtend.p2 = bestInter;
+                }
+            }
+        }
+
+        function runExtendArc(arcToExtend, clickPt, boundarySegments) {
+            const distToP1 = arcToExtend.p1.distanceTo(clickPt);
+            const distToP2 = arcToExtend.p2.distanceTo(clickPt);
+            const endpointToMove = distToP1 < distToP2 ? arcToExtend.p1 : arcToExtend.p2;
+            const isP1 = distToP1 < distToP2;
+
+            const center = arcToExtend.center;
+            const radius = arcToExtend.radius;
+            if (radius < 0.01) return;
+
+            const ccw = arcToExtend.counterClockwise;
+            const moveAngle = normalizeAngle(Math.atan2(endpointToMove.y - center.y, endpointToMove.x - center.x));
+
+            // Buscar interseções com o círculo de MESMO centro/raio
+            let bestAngle = null;
+            let bestDist = Infinity;
+
+            for (const boundary of boundarySegments) {
+                const inters = lineCircleIntersections(boundary.p1, boundary.p2, center, radius);
+                for (const inter of inters) {
+                    const angle = normalizeAngle(Math.atan2(inter.y - center.y, inter.x - center.x));
+                    if (angle === moveAngle) continue; // mesmo ponto
+
+                    // Direção de extensão:
+                    // p1 (início): estender para TRÁS (antes do startAngle)
+                    // p2 (fim): estender para FRENTE (depois do endAngle)
+                    let extendDist;
+                    if (isP1) {
+                        extendDist = ccw
+                            ? normalizeAngle(moveAngle - angle)
+                            : normalizeAngle(angle - moveAngle);
+                    } else {
+                        extendDist = ccw
+                            ? normalizeAngle(angle - moveAngle)
+                            : normalizeAngle(moveAngle - angle);
+                    }
+
+                    if (extendDist > 0.02 && extendDist < Math.PI * 1.8) {
+                        const arcDist = radius * extendDist;
+                        if (arcDist < bestDist) {
+                            bestDist = arcDist;
+                            bestAngle = angle;
+                        }
+                    }
+                }
+            }
+
+            if (bestAngle !== null) {
+                const newEndpoint = new Point(
+                    center.x + radius * Math.cos(bestAngle),
+                    center.y + radius * Math.sin(bestAngle)
+                );
+
+                // Calcular novo p3 no meio do arco estendido
+                const otherEndpoint = isP1 ? arcToExtend.p2 : arcToExtend.p1;
+                const otherAngle = normalizeAngle(Math.atan2(otherEndpoint.y - center.y, otherEndpoint.x - center.x));
+                const newStart = isP1 ? bestAngle : otherAngle;
+                const newEnd = isP1 ? otherAngle : bestAngle;
+
+                let midAngle;
+                if (ccw) {
+                    midAngle = normalizeAngle(newStart + normalizeAngle(newEnd - newStart) / 2);
+                } else {
+                    midAngle = normalizeAngle(newEnd + normalizeAngle(newStart - newEnd) / 2);
+                }
+                const newP3 = new Point(
+                    center.x + radius * Math.cos(midAngle),
+                    center.y + radius * Math.sin(midAngle)
+                );
+
+                // Atualizar os pontos
+                if (isP1) {
+                    arcToExtend.p1 = newEndpoint;
+                } else {
+                    arcToExtend.p2 = newEndpoint;
+                }
+                arcToExtend.p3 = newP3;
+
+                // NÃO chamar _compute()! Manter centro/raio originais
+                // Atualizar startAngle/endAngle manualmente
+                arcToExtend.startAngle = normalizeAngle(Math.atan2(arcToExtend.p1.y - center.y, arcToExtend.p1.x - center.x));
+                arcToExtend.endAngle = normalizeAngle(Math.atan2(arcToExtend.p2.y - center.y, arcToExtend.p2.x - center.x));
+            }
+        }
+
+        function runExtendPolylineSegment(polyline, segmentIndex, clickPt, boundarySegments) {
+            const pA = polyline.points[segmentIndex];
+            const pB = polyline.points[segmentIndex + 1];
+            
+            // Cria Line temporário com referências diretas
+            const tempLine = new Line(pA, pB);
+            runExtendLine(tempLine, clickPt, boundarySegments);
+            
+            // Verifica qual endpoint foi substituído e atualiza a polyline
+            // Compara por valor (não referência)
+            if (Math.abs(tempLine.p1.x - pA.x) > 0.01 || Math.abs(tempLine.p1.y - pA.y) > 0.01) {
+                polyline.points[segmentIndex] = tempLine.p1;
+            }
+            if (Math.abs(tempLine.p2.x - pB.x) > 0.01 || Math.abs(tempLine.p2.y - pB.y) > 0.01) {
+                polyline.points[segmentIndex + 1] = tempLine.p2;
+            }
+        }
+
         function runOffset(shape, clickPt, distance) {
             if (!shape || !(shape instanceof Line)) return;
             let dx = shape.p2.x - shape.p1.x; let dy = shape.p2.y - shape.p1.y; let len = Math.hypot(dx, dy);
@@ -760,6 +1119,31 @@
                     shape.p3.x += dx; shape.p3.y += dy;
                     shape._compute();
                 }
+            });
+        }
+
+        // Cria cópia de um shape (retorna novo objeto com coordenadas deslocadas)
+        function copyShape(shape, dx, dy) {
+            if (shape instanceof Line) {
+                return new Line(new Point(shape.p1.x + dx, shape.p1.y + dy), new Point(shape.p2.x + dx, shape.p2.y + dy));
+            } else if (shape instanceof Circle) {
+                return new Circle(new Point(shape.center.x + dx, shape.center.y + dy), shape.radius);
+            } else if (shape instanceof Polyline) {
+                return new Polyline(shape.points.map(p => new Point(p.x + dx, p.y + dy)));
+            } else if (shape instanceof Arc) {
+                const p1 = new Point(shape.p1.x + dx, shape.p1.y + dy);
+                const p2 = new Point(shape.p2.x + dx, shape.p2.y + dy);
+                const p3 = new Point(shape.p3.x + dx, shape.p3.y + dy);
+                return new Arc(p1, p3, p2);
+            }
+            return null;
+        }
+
+        function applyCopyMultiple(items, base, target) {
+            let dx = target.x - base.x; let dy = target.y - base.y;
+            items.forEach(shape => {
+                const copied = copyShape(shape, dx, dy);
+                if (copied) shapes.push(copied);
             });
         }
 
@@ -806,6 +1190,13 @@
                 }
                 resetState(); return;
             }
+            // Shift+T: limpar pontos de OTrack manualmente
+            if (e.key === 'T' && e.shiftKey) {
+                OTRACK.clear();
+                trackedPoints = [];
+                drawEverything();
+                return;
+            }
             if (e.key === 'Enter') {
                 // Se estiver desenhando uma polyline, finaliza injetando os pontos acumulados
                 if (currentMode === 'polyline' && currentPoints.length > 1) {
@@ -822,6 +1213,26 @@
                     selectionPhase = "axis1";
                     updateInstructions(); drawEverything(); return;
                 }
+                // Se estiver no COPY e apertar Enter após selecionar, avança de fase
+                if (currentMode === 'copy' && selectionPhase === 'select' && selectedShapes.length > 0) {
+                    selectionPhase = "basepoint";
+                    updateInstructions(); drawEverything(); return;
+                }
+                // Se estiver no COPY e apertar Enter após cópia, finaliza
+                if (currentMode === 'copy' && selectionPhase === 'target') {
+                    clearSelection(); resetState(); return;
+                }
+                // Se estiver no EXTEND e apertar Enter após selecionar limites, avança
+                if (currentMode === 'extend' && extendPhase === 'boundary') {
+                    extendPhase = 'select';
+                    updateInstructions(); drawEverything(); return;
+                }
+                // Se estiver no EXTEND e apertar Enter, finaliza
+                if (currentMode === 'extend' && extendPhase === 'select') {
+                    extendBoundaries = [];
+                    extendPhase = 'boundary';
+                    resetState(); return;
+                }
                 processCommand(); return;
             }
             if (document.activeElement !== coordInput && e.key.match(/[0-9.,-]/)) coordInput.focus();
@@ -837,14 +1248,34 @@
 
             if (!val.includes(',')) {
                 let dist = parseFloat(val); if (isNaN(dist)) return;
-                let basePt = currentPoints.length > 0 ? currentPoints[currentPoints.length - 1] : (currentMode === 'move' ? moveBasePoint : null);
-                
+                let basePt = currentPoints.length > 0 ? currentPoints[currentPoints.length - 1] : null;
+                if (!basePt && currentMode === 'move' && moveBasePoint) basePt = moveBasePoint;
+                if (!basePt && currentMode === 'copy' && copyBasePoint) basePt = copyBasePoint;
+
                 if (basePt) {
-                    let angle = currentPolarAngle !== null ? currentPolarAngle : Math.atan2(screenToModel(screenMousePos).y - basePt.y, screenToModel(screenMousePos).x - basePt.x);
+                    let angle;
+                    if (currentPolarAngle !== null) {
+                        angle = currentPolarAngle;
+                    } else if (currentMode === 'polyline' && currentPoints.length >= 2) {
+                        const prevPt = currentPoints[currentPoints.length - 2];
+                        angle = Math.atan2(basePt.y - prevPt.y, basePt.x - prevPt.x);
+                    } else {
+                        let dx = computedPt.x - basePt.x;
+                        let dy = computedPt.y - basePt.y;
+                        if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) {
+                            angle = 0;
+                        } else {
+                            angle = Math.atan2(dy, dx);
+                        }
+                    }
                     let targetPt = new Point(basePt.x + dist * Math.cos(angle), basePt.y + dist * Math.sin(angle));
-                    
+
                     if (currentMode === 'move' && selectionPhase === 'target') {
                         applyMoveMultiple(selectedShapes, moveBasePoint, targetPt); clearSelection(); resetState();
+                    } else if (currentMode === 'copy' && selectionPhase === 'target') {
+                        applyCopyMultiple(selectedShapes, copyBasePoint, targetPt);
+                        copyBasePoint = targetPt;
+                        updateInstructions(); drawEverything();
                     } else {
                         addPointToCreation(targetPt);
                     }
@@ -913,6 +1344,48 @@
                 }
             }
 
+            // FLUXO DO COPY (igual ao Move, mas mantém originais)
+            if (currentMode === 'copy') {
+                if (selectionPhase === 'select') {
+                    const clickedShape = getShapeUnderMouse(pureModelMouse);
+                    if (clickedShape) {
+                        if (!selectedShapes.some(s => s.id === clickedShape.id)) selectedShapes.push(clickedShape);
+                        document.getElementById('select-count').innerText = selectedShapes.length;
+                    } else {
+                        isSelectingBox = true; selectionStartPt = pureModelMouse;
+                    }
+                    updateInstructions(); drawEverything(); return;
+                } else if (selectionPhase === 'basepoint') {
+                    copyBasePoint = snapClickModel;
+                    selectionPhase = 'target';
+                    updateInstructions(); drawEverything(); return;
+                } else if (selectionPhase === 'target') {
+                    applyCopyMultiple(selectedShapes, copyBasePoint, snapClickModel);
+                    // NAO limpa seleção - permite múltiplas cópias consecutivas
+                    copyBasePoint = snapClickModel; // novo ponto base = destino (copy multiple)
+                    updateInstructions(); drawEverything(); return;
+                }
+            }
+
+            // FLUXO DO EXTEND
+            if (currentMode === 'extend') {
+                if (extendPhase === 'boundary') {
+                    // Seleciona limites (objetos que serão usados como referência)
+                    const clickedShape = getShapeUnderMouse(pureModelMouse);
+                    if (clickedShape) {
+                        if (!extendBoundaries.some(s => s.id === clickedShape.id)) extendBoundaries.push(clickedShape);
+                    } else {
+                        // Caixa de seleção para limites
+                        isSelectingBox = true; selectionStartPt = pureModelMouse;
+                    }
+                    updateInstructions(); drawEverything(); return;
+                } else {
+                    // Fase de estender: clica no objeto a estender
+                    runExtend(pureModelMouse);
+                    drawEverything(); return;
+                }
+            }
+
             // OUTROS MODOS DE EDICÃO
             if (currentMode === 'delete') {
                 let clickedShape = getShapeUnderMouse(pureModelMouse);
@@ -948,14 +1421,16 @@
         function addPointToCreation(pt) {
             if (currentMode === 'line') {
                 if (currentPoints.length === 0) currentPoints.push(pt);
-                else { shapes.push(new Line(currentPoints[0], pt)); currentPoints = []; }
+                else {
+                    shapes.push(new Line(currentPoints[0], pt));
+                    currentPoints = [pt]; // Mantém endpoint como base do próximo segmento
+                }
             } else if (currentMode === 'polyline') {
                 currentPoints.push(pt);
             } else if (currentMode === 'circle') {
                 if (currentPoints.length === 0) currentPoints.push(pt);
                 else { shapes.push(new Circle(currentPoints[0], currentPoints[0].distanceTo(pt))); currentPoints = []; }
             } else if (currentMode === 'arc') {
-                // 3 cliques: [0]=início, [1]=fim, [2]=ponto intermediário
                 currentPoints.push(pt);
                 if (currentPoints.length === 3) {
                     const arc = new Arc(currentPoints[0], currentPoints[2], currentPoints[1]);
@@ -976,11 +1451,92 @@
         }
 
         function resetState() {
-            currentPoints = []; moveBasePoint = null; mirrorAxisP1 = null; trackedPoints = []; isSelectingBox = false; selectionPhase = "select";
+            currentPoints = []; moveBasePoint = null; mirrorAxisP1 = null; copyBasePoint = null; isSelectingBox = false; selectionPhase = "select";
+            extendBoundaries = []; extendPhase = "boundary";
+            OTRACK.clear();
+            trackedPoints = [];
             updateInstructions(); drawEverything();
         }
 
         function clearCanvas() { shapes = []; selectedShapes = []; clearSelection(); resetState(); }
+
+        function serializeShape(shape) {
+            if (shape instanceof Line) {
+                return { type: 'line', p1: { x: shape.p1.x, y: shape.p1.y }, p2: { x: shape.p2.x, y: shape.p2.y } };
+            } else if (shape instanceof Circle) {
+                return { type: 'circle', center: { x: shape.center.x, y: shape.center.y }, radius: shape.radius };
+            } else if (shape instanceof Polyline) {
+                return { type: 'polyline', points: shape.points.map(p => ({ x: p.x, y: p.y })) };
+            } else if (shape instanceof Arc) {
+                return { type: 'arc', p1: { x: shape.p1.x, y: shape.p1.y }, p2: { x: shape.p2.x, y: shape.p2.y }, p3: { x: shape.p3.x, y: shape.p3.y } };
+            }
+            return null;
+        }
+
+        function deserializeShape(data) {
+            if (data.type === 'line') {
+                return new Line(new Point(data.p1.x, data.p1.y), new Point(data.p2.x, data.p2.y));
+            } else if (data.type === 'circle') {
+                return new Circle(new Point(data.center.x, data.center.y), data.radius);
+            } else if (data.type === 'polyline') {
+                return new Polyline(data.points.map(p => new Point(p.x, p.y)));
+            } else if (data.type === 'arc') {
+                return new Arc(new Point(data.p1.x, data.p1.y), new Point(data.p3.x, data.p3.y), new Point(data.p2.x, data.p2.y));
+            }
+            return null;
+        }
+
+        function saveDrawing() {
+            const data = {
+                version: '1.0',
+                shapes: shapes.map(s => serializeShape(s)),
+                zoom: zoom,
+                panX: panX,
+                panY: panY
+            };
+            const json = JSON.stringify(data, null, 2);
+            const blob = new Blob([json], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `traceline_${new Date().toISOString().slice(0,10)}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function loadDrawing() {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = '.json';
+            input.onchange = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    try {
+                        const data = JSON.parse(ev.target.result);
+                        shapes = [];
+                        selectedShapes = [];
+                        if (data.shapes && Array.isArray(data.shapes)) {
+                            data.shapes.forEach(s => {
+                                const shape = deserializeShape(s);
+                                if (shape) shapes.push(shape);
+                            });
+                        }
+                        if (data.zoom) zoom = data.zoom;
+                        if (data.panX !== undefined) panX = data.panX;
+                        if (data.panY !== undefined) panY = data.panY;
+                        clearSelection();
+                        resetState();
+                        drawEverything();
+                    } catch (err) {
+                        alert('Erro ao carregar arquivo: ' + err.message);
+                    }
+                };
+                reader.readAsText(file);
+            };
+            input.click();
+        }
 
         function updateInstructions() {
             let inst = ""; let lbl = "Distância / Coord:";
@@ -1004,6 +1560,15 @@
                 else if (selectionPhase === "axis1") inst = `[Mirror 2/3] Clique no 1º ponto do EIXO DE ESPELHAMENTO.`;
                 else inst = `[Mirror 3/3] Clique no 2º ponto do eixo para concluir o espelhamento.`;
             }
+            else if (currentMode === 'copy') {
+                if (selectionPhase === "select") inst = `[Copy 1/2] Selecione os objetos a copiar e aperte ENTER.`;
+                else inst = `Clique no ponto BASE e depois no DESTINO (cliques consecutivos = múltiplas cópias).`;
+            }
+            else if (currentMode === 'extend') {
+                if (extendPhase === "boundary") inst = `[Extend 1/2] Selecione os objetos LIMITE e aperte ENTER.`;
+                else inst = `[Extend 2/2] Clique nos objetos a estender (perto da ponta a estender).`;
+            }
+            
             document.getElementById('instruction-display').innerText = inst;
             document.getElementById('prompt-label').innerText = lbl;
         }
@@ -1093,6 +1658,15 @@
                 ctx.save(); ctx.translate(dx, dy); selectedShapes.forEach(s => s.draw(ctx, false)); ctx.restore();
             }
 
+            // PREVIEW DE COPY
+            if (currentMode === 'copy' && selectionPhase === 'target' && copyBasePoint) {
+                ctx.strokeStyle = '#00ff88'; ctx.lineWidth = 1.5 / zoom;
+                ctx.setLineDash([4/zoom, 3/zoom]);
+                let dx = computedPt.x - copyBasePoint.x; let dy = computedPt.y - copyBasePoint.y;
+                ctx.save(); ctx.translate(dx, dy); selectedShapes.forEach(s => s.draw(ctx, false)); ctx.restore();
+                ctx.setLineDash([]);
+            }
+
             // PREVIEW DE MIRROR
             if (currentMode === 'mirror') {
                 if (selectionPhase === 'axis2' && mirrorAxisP1) {
@@ -1137,6 +1711,15 @@
                 }
             }
 
+            // EXTEND - destaca limites selecionados
+            if (currentMode === 'extend' && extendBoundaries.length > 0) {
+                ctx.save();
+                ctx.strokeStyle = 'rgba(255, 200, 0, 0.6)';
+                ctx.lineWidth = 3 / zoom;
+                extendBoundaries.forEach(s => s.draw(ctx, false));
+                ctx.restore();
+            }
+
             // POLAR
             if (currentPolarAngle !== null && !activeSnap && (currentPoints.length > 0 || (currentMode === 'move' && selectionPhase === 'target' && moveBasePoint) || (currentMode === 'mirror' && selectionPhase === 'axis2' && mirrorAxisP1))) {
                 let bp = currentPoints.length > 0 ? currentPoints[currentPoints.length - 1] : (currentMode === 'mirror' ? mirrorAxisP1 : moveBasePoint);
@@ -1155,42 +1738,59 @@
                 ctx.setLineDash([]);
             }
 
-            // OTRACK - renderiza as guias de rastreamento
+            // OTRACK - guias discretas (estilo AutoCAD)
             if (activeOTrackLines.length > 0) {
                 ctx.save();
-                ctx.strokeStyle = '#00e5ff';
+                ctx.strokeStyle = 'rgba(0, 229, 255, 0.35)';
                 ctx.lineWidth = 1 / zoom;
-                ctx.setLineDash([8 / zoom, 4 / zoom]);
+                ctx.setLineDash([5 / zoom, 3 / zoom]);
                 activeOTrackLines.forEach(vl => {
                     ctx.beginPath(); ctx.moveTo(vl.p1.x, vl.p1.y); ctx.lineTo(vl.p2.x, vl.p2.y); ctx.stroke();
-                });
-                // Marcadores de cruz nos pontos rastreados
-                ctx.setLineDash([]);
-                ctx.lineWidth = 1.5 / zoom;
-                trackedPoints.forEach(tp => {
-                    const s = 6 / zoom;
-                    ctx.beginPath();
-                    ctx.moveTo(tp.x - s, tp.y); ctx.lineTo(tp.x + s, tp.y);
-                    ctx.moveTo(tp.x, tp.y - s); ctx.lineTo(tp.x, tp.y + s);
-                    ctx.stroke();
                 });
                 ctx.restore();
             }
 
             ctx.restore();
 
-            // RENDER SNAP (Apenas se o snap estiver calculado e ativo)
+            // RENDER SNAP
             if (activeSnap) {
                 const sX = activeSnap.point.x * zoom + panX; const sY = activeSnap.point.y * zoom + panY;
-                ctx.lineWidth = 2; const size = 12;
-                if (activeSnap.type.includes("interseção") || activeSnap.type.includes("X")) {
-                    ctx.strokeStyle = '#ffff00'; ctx.beginPath(); ctx.moveTo(sX - size/2, sY - size/2); ctx.lineTo(sX + size/2, sY + size/2); ctx.moveTo(sX + size/2, sY - size/2); ctx.lineTo(sX - size/2, sY + size/2); ctx.stroke();
-                } else {
-                    ctx.strokeStyle = '#5cff5c';
-                    if (activeSnap.type === 'endpoint') ctx.strokeRect(sX - size/2, sY - size/2, size, size);
-                    else if (activeSnap.type === 'midpoint') { ctx.beginPath(); ctx.moveTo(sX, sY - size/2); ctx.lineTo(sX + size/2, sY + size/2); ctx.lineTo(sX - size/2, sY + size/2); ctx.closePath(); ctx.stroke(); }
-                    else if (activeSnap.type === 'center') { ctx.beginPath(); ctx.arc(sX, sY, size/2, 0, 2*Math.PI); ctx.stroke(); }
-                    else if (activeSnap.type === 'quadrant') { ctx.beginPath(); ctx.moveTo(sX, sY - size/2); ctx.lineTo(sX + size/2, sY); ctx.lineTo(sX, sY + size/2); ctx.lineTo(sX - size/2, sY); ctx.closePath(); ctx.stroke(); }
+                ctx.lineWidth = 2; const size = 10;
+                ctx.strokeStyle = '#5cff5c';
+
+                if (activeSnap.type === 'endpoint') ctx.strokeRect(sX - size/2, sY - size/2, size, size);
+                else if (activeSnap.type === 'vertex') {
+                    // Diamante pequeno para vértices internos
+                    ctx.beginPath();
+                    ctx.moveTo(sX, sY - size/2);
+                    ctx.lineTo(sX + size/2, sY);
+                    ctx.lineTo(sX, sY + size/2);
+                    ctx.lineTo(sX - size/2, sY);
+                    ctx.closePath();
+                    ctx.stroke();
+                }
+                else if (activeSnap.type === 'midpoint') { ctx.beginPath(); ctx.moveTo(sX, sY - size/2); ctx.lineTo(sX + size/2, sY + size/2); ctx.lineTo(sX - size/2, sY + size/2); ctx.closePath(); ctx.stroke(); }
+                else if (activeSnap.type === 'center') { ctx.beginPath(); ctx.arc(sX, sY, size/2, 0, 2*Math.PI); ctx.stroke(); }
+                else if (activeSnap.type === 'quadrant') { ctx.beginPath(); ctx.moveTo(sX, sY - size/2); ctx.lineTo(sX + size/2, sY); ctx.lineTo(sX, sY + size/2); ctx.lineTo(sX - size/2, sY); ctx.closePath(); ctx.stroke(); }
+            }
+            // Indicador para interseções OTrack (quando computedPt difere do snap)
+            else if (computedPt && OTRACK.tracked.length >= 2) {
+                // Verifica se é uma interseção de guias
+                for (let i = 0; i < OTRACK.tracked.length; i++) {
+                    for (let j = 0; j < OTRACK.tracked.length; j++) {
+                        if (i === j) continue;
+                        const inter = new Point(OTRACK.tracked[j].point.x, OTRACK.tracked[i].point.y);
+                        if (computedPt.distanceTo(inter) < 0.01) {
+                            const sX = inter.x * zoom + panX; const sY = inter.y * zoom + panY;
+                            ctx.strokeStyle = '#ffff00'; ctx.lineWidth = 2;
+                            const size = 8;
+                            ctx.beginPath();
+                            ctx.moveTo(sX - size/2, sY - size/2); ctx.lineTo(sX + size/2, sY + size/2);
+                            ctx.moveTo(sX + size/2, sY - size/2); ctx.lineTo(sX - size/2, sY + size/2);
+                            ctx.stroke();
+                            break;
+                        }
+                    }
                 }
             }
         }
