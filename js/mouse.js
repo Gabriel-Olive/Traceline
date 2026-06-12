@@ -43,9 +43,14 @@ canvas.addEventListener('mousedown', (e) => {
             mirrorAxisP1 = snapClickModel; selectionPhase = 'axis2';
             updateInstructions(); drawEverything(); return;
         } else if (selectionPhase === 'axis2') {
-            applyMirror(selectedShapes, mirrorAxisP1, snapClickModel);
-            mirrorAxisP1 = null; clearSelection(); resetState();
-            PROMPT.msg(`Mirror concluído.`); return;
+            const axisP1 = mirrorAxisP1;
+            const axisP2 = snapClickModel;
+            applyMirror(selectedShapes, axisP1, axisP2);
+            mirrorAxisP1 = null;
+            clearSelection();
+            resetState();
+            PROMPT.msg(`Mirror concluído.`);
+            return;
         }
     }
 
